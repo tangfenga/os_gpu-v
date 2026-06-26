@@ -4,6 +4,8 @@
 #include <cuda_runtime_api.h>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -90,6 +92,19 @@ bool RangeFits(size_t offset, size_t count, size_t size) {
     return offset <= size && count <= size - offset;
 }
 
+uint64_t ReadUint64Env(const char *name, uint64_t fallback) {
+    const char *env = std::getenv(name);
+    if (!env || env[0] == '\0') {
+        return fallback;
+    }
+    char *end = nullptr;
+    const unsigned long long value = std::strtoull(env, &end, 10);
+    if (!end || *end != '\0') {
+        return fallback;
+    }
+    return static_cast<uint64_t>(value);
+}
+
 using Clock = std::chrono::steady_clock;
 
 uint64_t ElapsedUs(Clock::time_point start, Clock::time_point end = Clock::now()) {
@@ -97,8 +112,24 @@ uint64_t ElapsedUs(Clock::time_point start, Clock::time_point end = Clock::now()
         std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 }
 
+uint64_t NowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count());
+}
+
 bool DetailedPerfRequested() {
     const char *env = std::getenv("VGPU_PERF_DETAIL");
+    return env && std::strcmp(env, "1") == 0;
+}
+
+bool PerfLogRequested() {
+    const char *env = std::getenv("VGPU_PERF_LOG");
+    return env && std::strcmp(env, "1") == 0;
+}
+
+bool InitTraceRequested() {
+    const char *env = std::getenv("VGPU_INIT_TRACE");
     return env && std::strcmp(env, "1") == 0;
 }
 
@@ -114,6 +145,9 @@ void LogPerf(
     uint64_t stream_id,
     int cuda_error,
     Clock::time_point start) {
+    if (!PerfLogRequested()) {
+        return;
+    }
     const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
         Clock::now() - start).count();
     std::cout << "[vgpu_perf] op=" << op
@@ -153,6 +187,7 @@ struct SessionState {
     ShmMapping shm;
     bool ring_enabled = false;
     std::atomic<bool> ring_stop{false};
+    std::atomic<int> pending_error{cudaSuccess};
     std::thread ring_thread;
     std::unordered_map<uint64_t, Allocation> allocations;
     std::unordered_map<uint64_t, CUmodule> modules;
@@ -184,13 +219,20 @@ public:
         grpc::ServerContext *,
         const vgpu::CreateSessionRequest *request,
         vgpu::CreateSessionReply *reply) override {
+        const auto total_start = Clock::now();
         const uint64_t session_id = next_session_id_.fetch_add(1);
         CUstream default_stream = nullptr;
         ShmMapping shm;
         bool shm_enabled = false;
         bool ring_enabled = false;
+        uint64_t shm_map_us = 0;
+        uint64_t ring_init_us = 0;
+        uint64_t cuda_context_us = 0;
+        uint64_t default_stream_us = 0;
+        uint64_t pin_shm_us = 0;
         if (!request->shm_name().empty() && request->shm_size() > 0 &&
             IsValidShmName(request->shm_name())) {
+            const auto shm_map_start = Clock::now();
             const int fd = shm_open(request->shm_name().c_str(), O_RDWR, 0600);
             if (fd >= 0) {
                 void *base = mmap(nullptr, static_cast<size_t>(request->shm_size()),
@@ -202,20 +244,27 @@ public:
                     shm.size = static_cast<size_t>(request->shm_size());
                     shm_enabled = true;
                     if (shm.size > vgpu_shm::kControlBytes) {
+                        const auto ring_init_start = Clock::now();
                         vgpu_shm::InitRing(shm.base);
+                        ring_init_us = ElapsedUs(ring_init_start);
                         ring_enabled = true;
                     }
                 } else {
                     close(fd);
                 }
             }
+            shm_map_us = ElapsedUs(shm_map_start);
         }
         std::shared_ptr<SessionState> session;
         {
             std::lock_guard<std::mutex> lock(mu_);
+            const auto cuda_context_start = Clock::now();
             CUresult result = EnsureCudaLocked();
+            cuda_context_us = ElapsedUs(cuda_context_start);
             if (result == CUDA_SUCCESS) {
+                const auto stream_start = Clock::now();
                 result = cuStreamCreate(&default_stream, CU_STREAM_NON_BLOCKING);
+                default_stream_us = ElapsedUs(stream_start);
             }
             if (result != CUDA_SUCCESS) {
                 if (shm.base) {
@@ -237,7 +286,9 @@ public:
             session->default_stream = default_stream;
             session->shm = std::move(shm);
             session->ring_enabled = ring_enabled;
+            const auto pin_start = Clock::now();
             TryPinShmArenaLocked(session);
+            pin_shm_us = ElapsedUs(pin_start);
             sessions_.emplace(session_id, session);
         }
 
@@ -255,16 +306,31 @@ public:
                 ? request->shm_size() - (ring_enabled ? vgpu_shm::kControlBytes : 0)
                 : 0);
 
-        std::cout << "[vgpu] op=CreateSession sid=" << session_id
-                  << " pid=" << request->client_pid()
-                  << " name=" << request->client_name()
-                  << " memory_limit=" << request->requested_memory_limit()
-                  << " shm_enabled=" << shm_enabled
-                  << " ring_enabled=" << ring_enabled
-                  << " shm_pinned=" << (session && session->shm.pinned)
-                  << " shm_name=" << request->shm_name()
-                  << " shm_size=" << request->shm_size()
-                  << " timeout_ms=" << session_timeout_ms_ << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=CreateSession sid=" << session_id
+                      << " pid=" << request->client_pid()
+                      << " name=" << request->client_name()
+                      << " memory_limit=" << request->requested_memory_limit()
+                      << " shm_enabled=" << shm_enabled
+                      << " ring_enabled=" << ring_enabled
+                      << " shm_pinned=" << (session && session->shm.pinned)
+                      << " shm_name=" << request->shm_name()
+                      << " shm_size=" << request->shm_size()
+                      << " timeout_ms=" << session_timeout_ms_ << std::endl;
+        }
+        if (InitTraceRequested()) {
+            std::cout << "init_trace side=server op=CreateSession"
+                      << " sid=" << session_id
+                      << " total_us=" << ElapsedUs(total_start)
+                      << " shm_map_us=" << shm_map_us
+                      << " ring_init_us=" << ring_init_us
+                      << " cuda_context_us=" << cuda_context_us
+                      << " default_stream_us=" << default_stream_us
+                      << " pin_shm_us=" << pin_shm_us
+                      << " shm_enabled=" << shm_enabled
+                      << " ring_enabled=" << ring_enabled
+                      << std::endl;
+        }
         return grpc::Status::OK;
     }
 
@@ -288,8 +354,10 @@ public:
         reply->set_cuda_error(session ? kCudaSuccess : kCudaErrorInvalidValue);
         reply->set_message(session ? "session destroyed" : "session not found");
 
-        std::cout << "[vgpu] op=DestroySession sid=" << request->session_id()
-                  << " found=" << static_cast<bool>(session) << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=DestroySession sid=" << request->session_id()
+                      << " found=" << static_cast<bool>(session) << std::endl;
+        }
         return grpc::Status::OK;
     }
 
@@ -460,7 +528,7 @@ public:
             return grpc::Status::OK;
         }
 
-        const uint64_t virtual_ptr = NextVirtualPtrLocked();
+        const uint64_t virtual_ptr = NextVirtualPtrLocked(static_cast<size_t>(request->size()));
         {
             std::lock_guard<std::mutex> session_lock(session->mu);
             if (session->closing) {
@@ -621,27 +689,9 @@ public:
         }
         TouchSession(session);
 
-        CUresult result = EnsureCudaLocked();
-        if (result == CUDA_SUCCESS) {
-            std::vector<CUstream> streams;
-            {
-                std::lock_guard<std::mutex> session_lock(session->mu);
-                streams.push_back(session->default_stream);
-                for (const auto &entry : session->streams) {
-                    streams.push_back(entry.second);
-                }
-            }
-            for (CUstream stream : streams) {
-                if (stream) {
-                    result = cuStreamSynchronize(stream);
-                    if (result != CUDA_SUCCESS) {
-                        break;
-                    }
-                }
-            }
-        }
+        CUresult result = DoDeviceSynchronize(session);
         reply->set_cuda_error(RuntimeError(result));
-        reply->set_message(result == CUDA_SUCCESS ? "session streams synchronized" : DriverErrorString(result));
+        reply->set_message(result == CUDA_SUCCESS ? "context synchronized" : DriverErrorString(result));
         return grpc::Status::OK;
     }
 
@@ -690,8 +740,10 @@ public:
         reply->set_cuda_error(kCudaSuccess);
         reply->set_message("stream created");
         reply->set_stream_id(stream_id);
-        std::cout << "[vgpu] op=StreamCreate sid=" << request->session_id()
-                  << " stream=" << stream_id << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=StreamCreate sid=" << request->session_id()
+                      << " stream=" << stream_id << std::endl;
+        }
         return grpc::Status::OK;
     }
 
@@ -1047,6 +1099,7 @@ public:
         grpc::ServerContext *,
         const vgpu::RegisterModuleRequest *request,
         vgpu::RegisterModuleReply *reply) override {
+        const auto total_start = Clock::now();
         if (request->fatbin().empty()) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("empty fatbin");
@@ -1069,6 +1122,7 @@ public:
         TouchSession(session);
 
         CUresult result = EnsureCudaLocked();
+        uint64_t module_load_us = 0;
         if (result != CUDA_SUCCESS) {
             reply->set_cuda_error(RuntimeError(result));
             reply->set_message(DriverErrorString(result));
@@ -1077,10 +1131,12 @@ public:
 
         FatbinWrapper wrapper{0x466243b1u, 1u, request->fatbin().data(), nullptr};
         CUmodule module = nullptr;
+        const auto module_load_start = Clock::now();
         result = cuModuleLoadFatBinary(&module, &wrapper);
         if (result != CUDA_SUCCESS) {
             result = cuModuleLoadData(&module, request->fatbin().data());
         }
+        module_load_us = ElapsedUs(module_load_start);
         if (result != CUDA_SUCCESS) {
             reply->set_cuda_error(RuntimeError(result));
             reply->set_message(DriverErrorString(result));
@@ -1101,9 +1157,20 @@ public:
         reply->set_cuda_error(kCudaSuccess);
         reply->set_message("module registered");
         reply->set_module_id(module_id);
-        std::cout << "[vgpu] op=RegisterModule sid=" << request->session_id()
-                  << " module=" << module_id
-                  << " bytes=" << request->fatbin().size() << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=RegisterModule sid=" << request->session_id()
+                      << " module=" << module_id
+                      << " bytes=" << request->fatbin().size() << std::endl;
+        }
+        if (InitTraceRequested()) {
+            std::cout << "init_trace side=server op=RegisterModule"
+                      << " sid=" << request->session_id()
+                      << " module=" << module_id
+                      << " total_us=" << ElapsedUs(total_start)
+                      << " module_load_us=" << module_load_us
+                      << " bytes=" << request->fatbin().size()
+                      << std::endl;
+        }
         return grpc::Status::OK;
     }
 
@@ -1171,9 +1238,10 @@ public:
                 uint64_t maybe_virtual_ptr = 0;
                 std::memcpy(&maybe_virtual_ptr, data.data(), sizeof(maybe_virtual_ptr));
                 std::lock_guard<std::mutex> session_lock(session->mu);
-                auto alloc_it = session->allocations.find(maybe_virtual_ptr);
-                if (alloc_it != session->allocations.end()) {
-                    CUdeviceptr real_ptr = alloc_it->second.device_ptr;
+                uint64_t ptr_offset = 0;
+                const Allocation *allocation = FindAllocationLocked(*session, maybe_virtual_ptr, 0, &ptr_offset);
+                if (allocation) {
+                    CUdeviceptr real_ptr = allocation->device_ptr + ptr_offset;
                     std::memcpy(data.data(), &real_ptr, sizeof(real_ptr));
                 }
             }
@@ -1195,15 +1263,17 @@ public:
         reply->set_cuda_error(RuntimeError(result));
         reply->set_message(result == CUDA_SUCCESS ? "kernel launched" : DriverErrorString(result));
         LogPerf("LaunchKernel", request->session_id(), 0, request->stream_id(), RuntimeError(result), op_start);
-        std::cout << "[vgpu] op=LaunchKernel sid=" << request->session_id()
-                  << " module=" << request->module_id()
-                  << " kernel=" << request->kernel_name()
-                  << " grid=(" << request->grid_dim().x() << ","
-                  << request->grid_dim().y() << "," << request->grid_dim().z() << ")"
-                  << " block=(" << request->block_dim().x() << ","
-                  << request->block_dim().y() << "," << request->block_dim().z() << ")"
-                  << " args=" << request->args_size()
-                  << " result=" << DriverErrorString(result) << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=LaunchKernel sid=" << request->session_id()
+                      << " module=" << request->module_id()
+                      << " kernel=" << request->kernel_name()
+                      << " grid=(" << request->grid_dim().x() << ","
+                      << request->grid_dim().y() << "," << request->grid_dim().z() << ")"
+                      << " block=(" << request->block_dim().x() << ","
+                      << request->block_dim().y() << "," << request->block_dim().z() << ")"
+                      << " args=" << request->args_size()
+                      << " result=" << DriverErrorString(result) << std::endl;
+        }
         return grpc::Status::OK;
     }
 
@@ -1246,16 +1316,20 @@ private:
             session->shm.pinned_base = arena_base;
             session->shm.pinned_size = arena_size;
             session->shm.pinned = true;
-            std::cout << "[vgpu] op=PinShm sid=" << session->session_id
-                      << " bytes=" << arena_size
-                      << " offset=" << data_offset
-                      << " result=success" << std::endl;
+            if (DetailedPerfRequested()) {
+                std::cout << "[vgpu] op=PinShm sid=" << session->session_id
+                          << " bytes=" << arena_size
+                          << " offset=" << data_offset
+                          << " result=success" << std::endl;
+            }
         } else {
-            std::cout << "[vgpu] op=PinShm sid=" << session->session_id
-                      << " bytes=" << arena_size
-                      << " offset=" << data_offset
-                      << " result=failed"
-                      << " error=" << DriverErrorString(result) << std::endl;
+            if (DetailedPerfRequested()) {
+                std::cout << "[vgpu] op=PinShm sid=" << session->session_id
+                          << " bytes=" << arena_size
+                          << " offset=" << data_offset
+                          << " result=failed"
+                          << " error=" << DriverErrorString(result) << std::endl;
+            }
         }
     }
 
@@ -1264,10 +1338,12 @@ private:
             return;
         }
         const CUresult result = cuMemHostUnregister(session->shm.pinned_base);
-        std::cout << "[vgpu] op=UnpinShm sid=" << session->session_id
-                  << " bytes=" << session->shm.pinned_size
-                  << " cuda_error=" << RuntimeError(result)
-                  << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=UnpinShm sid=" << session->session_id
+                      << " bytes=" << session->shm.pinned_size
+                      << " cuda_error=" << RuntimeError(result)
+                      << std::endl;
+        }
         session->shm.pinned_base = nullptr;
         session->shm.pinned_size = 0;
         session->shm.pinned = false;
@@ -1288,29 +1364,33 @@ private:
         session->ring_enabled = false;
     }
 
+    void StorePendingError(const std::shared_ptr<SessionState> &session, int cuda_error) {
+        if (!session || cuda_error == cudaSuccess) {
+            return;
+        }
+        int expected = cudaSuccess;
+        session->pending_error.compare_exchange_strong(expected, cuda_error);
+    }
+
+    int TakePendingError(const std::shared_ptr<SessionState> &session) {
+        if (!session) {
+            return cudaSuccess;
+        }
+        return session->pending_error.exchange(cudaSuccess);
+    }
+
     CUresult DoDeviceSynchronize(const std::shared_ptr<SessionState> &session) {
+        (void)session;
         CUresult result = EnsureCudaLocked();
         if (result != CUDA_SUCCESS) {
             return result;
         }
-
-        std::vector<CUstream> streams;
-        {
-            std::lock_guard<std::mutex> session_lock(session->mu);
-            streams.push_back(session->default_stream);
-            for (const auto &entry : session->streams) {
-                streams.push_back(entry.second);
-            }
+        result = cuCtxSynchronize();
+        if (result != CUDA_SUCCESS) {
+            return result;
         }
-        for (CUstream stream : streams) {
-            if (stream) {
-                result = cuStreamSynchronize(stream);
-                if (result != CUDA_SUCCESS) {
-                    return result;
-                }
-            }
-        }
-        return CUDA_SUCCESS;
+        const int pending = TakePendingError(session);
+        return pending == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
     }
 
     CUresult DoStreamSynchronize(const std::shared_ptr<SessionState> &session, uint64_t stream_id) {
@@ -1325,7 +1405,11 @@ private:
         if (result == CUDA_SUCCESS) {
             result = cuStreamSynchronize(stream);
         }
-        return result;
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+        const int pending = TakePendingError(session);
+        return pending == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
     }
 
     CUresult DoEventSynchronize(const std::shared_ptr<SessionState> &session, uint64_t event_id) {
@@ -1406,9 +1490,10 @@ private:
                 uint64_t maybe_virtual_ptr = 0;
                 std::memcpy(&maybe_virtual_ptr, data.data(), sizeof(maybe_virtual_ptr));
                 std::lock_guard<std::mutex> session_lock(session->mu);
-                auto alloc_it = session->allocations.find(maybe_virtual_ptr);
-                if (alloc_it != session->allocations.end()) {
-                    CUdeviceptr real_ptr = alloc_it->second.device_ptr;
+                uint64_t ptr_offset = 0;
+                const Allocation *allocation = FindAllocationLocked(*session, maybe_virtual_ptr, 0, &ptr_offset);
+                if (allocation) {
+                    CUdeviceptr real_ptr = allocation->device_ptr + ptr_offset;
                     std::memcpy(data.data(), &real_ptr, sizeof(real_ptr));
                 }
             }
@@ -1429,10 +1514,187 @@ private:
             nullptr);
     }
 
+    CUresult DoMemcpyD2DRingFast(
+        const std::shared_ptr<SessionState> &session,
+        vgpu_shm::RingEntry *entry) {
+        entry->t_context_start_ns = NowNs();
+        CUresult result = EnsureCudaLocked();
+        entry->t_context_end_ns = NowNs();
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+
+        CUdeviceptr dst_ptr = 0;
+        CUdeviceptr src_ptr = 0;
+        CUstream stream = nullptr;
+        uint64_t dst_offset = 0;
+        uint64_t src_offset = 0;
+        entry->t_lookup_start_ns = NowNs();
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            const Allocation *dst = FindAllocationLocked(*session, entry->dst_device_ptr, entry->count, &dst_offset);
+            const Allocation *src = FindAllocationLocked(*session, entry->src_device_ptr, entry->count, &src_offset);
+            if (!dst || !src || !ResolveStreamLocked(*session, entry->stream_id, &stream)) {
+                entry->t_lookup_end_ns = NowNs();
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            dst_ptr = dst->device_ptr + dst_offset;
+            src_ptr = src->device_ptr + src_offset;
+        }
+        entry->t_lookup_end_ns = NowNs();
+        entry->t_rebuild_start_ns = NowNs();
+        entry->t_rebuild_end_ns = entry->t_rebuild_start_ns;
+
+        entry->t_driver_start_ns = NowNs();
+        result = cuMemcpyDtoDAsync(dst_ptr, src_ptr, static_cast<size_t>(entry->count), stream);
+        entry->t_driver_end_ns = NowNs();
+        if (result == CUDA_SUCCESS && entry->async == 0) {
+            result = cuStreamSynchronize(stream);
+        }
+        return result;
+    }
+
+    CUresult DoLaunchKernelRingFast(
+        const std::shared_ptr<SessionState> &session,
+        vgpu_shm::RingEntry *entry) {
+        if (entry->arg_count > vgpu_shm::kMaxKernelArgs ||
+            entry->arg_bytes > vgpu_shm::kMaxKernelArgBytes ||
+            entry->kernel_name[0] == '\0') {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+
+        entry->t_context_start_ns = NowNs();
+        CUresult result = EnsureCudaLocked();
+        entry->t_context_end_ns = NowNs();
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+
+        CUmodule module = nullptr;
+        CUstream stream = nullptr;
+        CUfunction function = nullptr;
+        entry->t_lookup_start_ns = NowNs();
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            auto module_it = session->modules.find(entry->module_id);
+            if (module_it == session->modules.end() ||
+                !ResolveStreamLocked(*session, entry->stream_id, &stream)) {
+                entry->t_lookup_end_ns = NowNs();
+                return CUDA_ERROR_INVALID_HANDLE;
+            }
+            module = module_it->second;
+        }
+        result = cuModuleGetFunction(&function, module, entry->kernel_name);
+        if (result != CUDA_SUCCESS) {
+            entry->t_lookup_end_ns = NowNs();
+            return result;
+        }
+        entry->t_lookup_end_ns = NowNs();
+
+        unsigned char arg_storage[vgpu_shm::kMaxKernelArgBytes] = {};
+        void *kernel_params[vgpu_shm::kMaxKernelArgs] = {};
+        entry->t_rebuild_start_ns = NowNs();
+        std::memcpy(arg_storage, entry->arg_data, entry->arg_bytes);
+        for (uint32_t i = 0; i < entry->arg_count; ++i) {
+            const uint32_t offset = entry->arg_offsets[i];
+            const uint32_t size = entry->arg_sizes[i];
+            if (size == 0 || offset > entry->arg_bytes || size > entry->arg_bytes - offset) {
+                entry->t_rebuild_end_ns = NowNs();
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            unsigned char *data = arg_storage + offset;
+            if (size == sizeof(uint64_t)) {
+                uint64_t maybe_virtual_ptr = 0;
+                std::memcpy(&maybe_virtual_ptr, data, sizeof(maybe_virtual_ptr));
+                std::lock_guard<std::mutex> session_lock(session->mu);
+                uint64_t ptr_offset = 0;
+                const Allocation *allocation = FindAllocationLocked(*session, maybe_virtual_ptr, 0, &ptr_offset);
+                if (allocation) {
+                    CUdeviceptr real_ptr = allocation->device_ptr + ptr_offset;
+                    std::memcpy(data, &real_ptr, sizeof(real_ptr));
+                }
+            }
+            kernel_params[i] = data;
+        }
+        entry->t_rebuild_end_ns = NowNs();
+
+        entry->t_driver_start_ns = NowNs();
+        result = cuLaunchKernel(
+            function,
+            entry->grid_dim[0],
+            entry->grid_dim[1],
+            entry->grid_dim[2],
+            entry->block_dim[0],
+            entry->block_dim[1],
+            entry->block_dim[2],
+            static_cast<unsigned int>(entry->shared_mem),
+            stream,
+            kernel_params,
+            nullptr);
+        entry->t_driver_end_ns = NowNs();
+        return result;
+    }
+
+    CUresult DoStreamSynchronizeRingFast(
+        const std::shared_ptr<SessionState> &session,
+        vgpu_shm::RingEntry *entry) {
+        entry->t_context_start_ns = NowNs();
+        CUresult result = EnsureCudaLocked();
+        entry->t_context_end_ns = NowNs();
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+
+        CUstream stream = nullptr;
+        entry->t_lookup_start_ns = NowNs();
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            if (!ResolveStreamLocked(*session, entry->stream_id, &stream)) {
+                entry->t_lookup_end_ns = NowNs();
+                return CUDA_ERROR_INVALID_HANDLE;
+            }
+        }
+        entry->t_lookup_end_ns = NowNs();
+        entry->t_rebuild_start_ns = NowNs();
+        entry->t_rebuild_end_ns = entry->t_rebuild_start_ns;
+
+        entry->t_driver_start_ns = NowNs();
+        result = cuStreamSynchronize(stream);
+        entry->t_driver_end_ns = NowNs();
+        if (result != CUDA_SUCCESS) {
+            return result;
+        }
+        const int pending = TakePendingError(session);
+        return pending == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
+    }
+
+    void TryBindRingWorker(uint64_t session_id) {
+#if defined(__linux__)
+        const unsigned int cpus = std::thread::hardware_concurrency();
+        if (cpus <= 1) {
+            return;
+        }
+        const uint64_t base = ReadUint64Env("VGPU_RING_CPU_BASE", 1);
+        const int cpu = static_cast<int>((base + session_id - 1) % cpus);
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        const int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=BindRingWorker sid=" << session_id
+                      << " cpu=" << cpu
+                      << " result=" << rc << std::endl;
+        }
+#else
+        (void)session_id;
+#endif
+    }
+
     void RingWorkerLoop(std::shared_ptr<SessionState> session) {
         if (!session || !session->shm.base) {
             return;
         }
+        TryBindRingWorker(session->session_id);
         auto *header = vgpu_shm::Header(session->shm.base);
         auto *entries = vgpu_shm::Entries(session->shm.base);
         if (!vgpu_shm::HeaderLooksReady(header)) {
@@ -1441,7 +1703,7 @@ private:
 
         uint32_t idle_iters = 0;
         while (!session->ring_stop.load()) {
-            const uint64_t tail = vgpu_shm::LoadAcquire(&header->tail);
+            uint64_t tail = vgpu_shm::LoadAcquire(&header->tail);
             const uint64_t head = vgpu_shm::LoadAcquire(&header->head);
             if (tail == head) {
                 if (vgpu_shm::LoadAcquire(&header->stop) != 0) {
@@ -1464,81 +1726,89 @@ private:
             }
             idle_iters = 0;
 
-            const auto op_start = Clock::now();
-            vgpu_shm::RingEntry *entry = &entries[tail % vgpu_shm::kRingCapacity];
-            int cuda_error = kCudaErrorInvalidValue;
-            if (entry->op == vgpu_shm::kRingOpMemcpyShm) {
-                TouchSession(session);
-                vgpu::MemcpyShmRequest request;
-                request.set_session_id(session->session_id);
-                request.set_dst_device_ptr(entry->dst_device_ptr);
-                request.set_src_device_ptr(entry->src_device_ptr);
-                request.set_count(entry->count);
-                request.set_kind(entry->kind);
-                request.set_shm_offset(entry->shm_offset);
-                request.set_stream_id(entry->stream_id);
-                request.set_async(entry->async != 0);
+            while (tail < head && !session->ring_stop.load()) {
+                const auto op_start = Clock::now();
+                vgpu_shm::RingEntry *entry = &entries[tail % vgpu_shm::kRingCapacity];
+                entry->t_server_dequeue_ns = NowNs();
+                int cuda_error = kCudaErrorInvalidValue;
+                if (entry->op == vgpu_shm::kRingOpMemcpyShm) {
+                    TouchSession(session);
+                    vgpu::MemcpyShmRequest request;
+                    request.set_session_id(session->session_id);
+                    request.set_dst_device_ptr(entry->dst_device_ptr);
+                    request.set_src_device_ptr(entry->src_device_ptr);
+                    request.set_count(entry->count);
+                    request.set_kind(entry->kind);
+                    request.set_shm_offset(entry->shm_offset);
+                    request.set_stream_id(entry->stream_id);
+                    request.set_async(entry->async != 0);
 
-                CUresult result = EnsureCudaLocked();
-                if (result == CUDA_SUCCESS) {
-                    result = DoMemcpyShm(session, request);
+                    entry->t_driver_start_ns = NowNs();
+                    CUresult result = EnsureCudaLocked();
+                    if (result == CUDA_SUCCESS) {
+                        result = DoMemcpyShm(session, request);
+                    }
+                    entry->t_driver_end_ns = NowNs();
+                    cuda_error = RuntimeError(result);
+                    LogPerf(
+                        request.async() ? "MemcpyShmRingAsync" : "MemcpyShmRing",
+                        session->session_id,
+                        request.count(),
+                        request.stream_id(),
+                        cuda_error,
+                        op_start);
+                } else if (entry->op == vgpu_shm::kRingOpMemcpyD2D) {
+                    TouchSession(session);
+                    CUresult result = DoMemcpyD2DRingFast(session, entry);
+                    cuda_error = RuntimeError(result);
+                    LogPerf(
+                        entry->async ? "MemcpyD2DRingAsync" : "MemcpyD2DRing",
+                        session->session_id,
+                        entry->count,
+                        entry->stream_id,
+                        cuda_error,
+                        op_start);
+                } else if (entry->op == vgpu_shm::kRingOpDeviceSynchronize) {
+                    TouchSession(session);
+                    entry->t_driver_start_ns = NowNs();
+                    cuda_error = RuntimeError(DoDeviceSynchronize(session));
+                    entry->t_driver_end_ns = NowNs();
+                    LogPerf("DeviceSynchronizeRing", session->session_id, 0, 0, cuda_error, op_start);
+                } else if (entry->op == vgpu_shm::kRingOpStreamSynchronize) {
+                    TouchSession(session);
+                    cuda_error = RuntimeError(DoStreamSynchronizeRingFast(session, entry));
+                    LogPerf("StreamSynchronizeRing", session->session_id, 0, entry->stream_id, cuda_error, op_start);
+                } else if (entry->op == vgpu_shm::kRingOpEventSynchronize) {
+                    TouchSession(session);
+                    entry->t_driver_start_ns = NowNs();
+                    cuda_error = RuntimeError(DoEventSynchronize(session, entry->event_id));
+                    entry->t_driver_end_ns = NowNs();
+                    LogPerf("EventSynchronizeRing", session->session_id, 0, 0, cuda_error, op_start);
+                } else if (entry->op == vgpu_shm::kRingOpEventQuery) {
+                    TouchSession(session);
+                    entry->t_driver_start_ns = NowNs();
+                    cuda_error = RuntimeError(DoEventQuery(session, entry->event_id));
+                    entry->t_driver_end_ns = NowNs();
+                    LogPerf("EventQueryRing", session->session_id, 0, 0, cuda_error, op_start);
+                } else if (entry->op == vgpu_shm::kRingOpLaunchKernel) {
+                    TouchSession(session);
+                    cuda_error = RuntimeError(DoLaunchKernelRingFast(session, entry));
+                    LogPerf("LaunchKernelRing", session->session_id, 0, entry->stream_id, cuda_error, op_start);
+                } else {
+                    entry->t_driver_start_ns = NowNs();
+                    entry->t_driver_end_ns = entry->t_driver_start_ns;
                 }
-                cuda_error = RuntimeError(result);
-                LogPerf(
-                    request.async() ? "MemcpyShmRingAsync" : "MemcpyShmRing",
-                    session->session_id,
-                    request.count(),
-                    request.stream_id(),
-                    cuda_error,
-                    op_start);
-            } else if (entry->op == vgpu_shm::kRingOpMemcpyD2D) {
-                TouchSession(session);
-                vgpu::MemcpyShmRequest request;
-                request.set_session_id(session->session_id);
-                request.set_dst_device_ptr(entry->dst_device_ptr);
-                request.set_src_device_ptr(entry->src_device_ptr);
-                request.set_count(entry->count);
-                request.set_kind(cudaMemcpyDeviceToDevice);
-                request.set_stream_id(entry->stream_id);
-                request.set_async(entry->async != 0);
 
-                CUresult result = EnsureCudaLocked();
-                if (result == CUDA_SUCCESS) {
-                    result = DoMemcpyShm(session, request);
+                entry->cuda_error = cuda_error;
+                if ((entry->op == vgpu_shm::kRingOpMemcpyD2D && entry->async != 0) ||
+                    entry->op == vgpu_shm::kRingOpLaunchKernel) {
+                    StorePendingError(session, cuda_error);
                 }
-                cuda_error = RuntimeError(result);
-                LogPerf(
-                    request.async() ? "MemcpyD2DRingAsync" : "MemcpyD2DRing",
-                    session->session_id,
-                    request.count(),
-                    request.stream_id(),
-                    cuda_error,
-                    op_start);
-            } else if (entry->op == vgpu_shm::kRingOpDeviceSynchronize) {
-                TouchSession(session);
-                cuda_error = RuntimeError(DoDeviceSynchronize(session));
-                LogPerf("DeviceSynchronizeRing", session->session_id, 0, 0, cuda_error, op_start);
-            } else if (entry->op == vgpu_shm::kRingOpStreamSynchronize) {
-                TouchSession(session);
-                cuda_error = RuntimeError(DoStreamSynchronize(session, entry->stream_id));
-                LogPerf("StreamSynchronizeRing", session->session_id, 0, entry->stream_id, cuda_error, op_start);
-            } else if (entry->op == vgpu_shm::kRingOpEventSynchronize) {
-                TouchSession(session);
-                cuda_error = RuntimeError(DoEventSynchronize(session, entry->event_id));
-                LogPerf("EventSynchronizeRing", session->session_id, 0, 0, cuda_error, op_start);
-            } else if (entry->op == vgpu_shm::kRingOpEventQuery) {
-                TouchSession(session);
-                cuda_error = RuntimeError(DoEventQuery(session, entry->event_id));
-                LogPerf("EventQueryRing", session->session_id, 0, 0, cuda_error, op_start);
-            } else if (entry->op == vgpu_shm::kRingOpLaunchKernel) {
-                TouchSession(session);
-                cuda_error = RuntimeError(DoLaunchKernelRing(session, *entry));
-                LogPerf("LaunchKernelRing", session->session_id, 0, entry->stream_id, cuda_error, op_start);
+                entry->t_server_complete_ns = NowNs();
+                vgpu_shm::StoreRelease(&entry->done, 1);
+                ++tail;
+                vgpu_shm::StoreRelease(&header->tail, tail);
             }
-
-            entry->cuda_error = cuda_error;
-            vgpu_shm::StoreRelease(&entry->done, 1);
-            vgpu_shm::StoreRelease(&header->tail, tail + 1);
         }
     }
 
@@ -1611,8 +1881,10 @@ private:
         }
         session->shm.name.clear();
 
-        std::cout << "[vgpu] op=CleanupSession sid=" << sid
-                  << " reason=" << reason << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=CleanupSession sid=" << sid
+                      << " reason=" << reason << std::endl;
+        }
     }
 
     void ReaperLoop() {
@@ -1695,9 +1967,12 @@ private:
         return CUDA_SUCCESS;
     }
 
-    uint64_t NextVirtualPtrLocked() {
-        const uint64_t id = next_virtual_ptr_id_.fetch_add(1);
-        return kVirtualPtrBase + id * kVirtualPtrStride;
+    uint64_t NextVirtualPtrLocked(size_t size) {
+        constexpr uint64_t kVirtualPtrAlignment = 0x1000ull;
+        const uint64_t aligned_size =
+            (static_cast<uint64_t>(size) + kVirtualPtrAlignment - 1) & ~(kVirtualPtrAlignment - 1);
+        const uint64_t span = aligned_size + kVirtualPtrAlignment;
+        return next_virtual_ptr_.fetch_add(span);
     }
 
     uint64_t NextVirtualStreamLocked() {
@@ -1765,15 +2040,26 @@ private:
         return grpc::Status::OK;
     }
 
-    const Allocation *FindAllocationLocked(SessionState &session, uint64_t virtual_ptr, size_t count) {
-        auto it = session.allocations.find(virtual_ptr);
-        if (it == session.allocations.end()) {
-            return nullptr;
+    const Allocation *FindAllocationLocked(
+        SessionState &session,
+        uint64_t virtual_ptr,
+        size_t count,
+        uint64_t *offset_out = nullptr) {
+        for (const auto &entry : session.allocations) {
+            const uint64_t base = entry.first;
+            const Allocation &allocation = entry.second;
+            if (virtual_ptr < base) {
+                continue;
+            }
+            const uint64_t offset = virtual_ptr - base;
+            if (offset <= allocation.size && count <= allocation.size - offset) {
+                if (offset_out) {
+                    *offset_out = offset;
+                }
+                return &allocation;
+            }
         }
-        if (count > it->second.size) {
-            return nullptr;
-        }
-        return &it->second;
+        return nullptr;
     }
 
     CUresult DoMemcpy(
@@ -1790,13 +2076,14 @@ private:
                     return CUDA_ERROR_INVALID_VALUE;
                 }
                 CUdeviceptr dst_ptr = 0;
+                uint64_t dst_offset = 0;
                 {
                     std::lock_guard<std::mutex> session_lock(session->mu);
-                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count);
+                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count, &dst_offset);
                     if (!dst || !ResolveStreamLocked(*session, request.stream_id(), &stream)) {
                         return CUDA_ERROR_INVALID_VALUE;
                     }
-                    dst_ptr = dst->device_ptr;
+                    dst_ptr = dst->device_ptr + dst_offset;
                 }
                 CUresult result = cuMemcpyHtoDAsync(dst_ptr, request.host_data().data(), count, stream);
                 if (result == CUDA_SUCCESS && !async_request) {
@@ -1806,13 +2093,14 @@ private:
             }
             case cudaMemcpyDeviceToHost: {
                 CUdeviceptr src_ptr = 0;
+                uint64_t src_offset = 0;
                 {
                     std::lock_guard<std::mutex> session_lock(session->mu);
-                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count);
+                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count, &src_offset);
                     if (!src || !ResolveStreamLocked(*session, request.stream_id(), &stream)) {
                         return CUDA_ERROR_INVALID_VALUE;
                     }
-                    src_ptr = src->device_ptr;
+                    src_ptr = src->device_ptr + src_offset;
                 }
                 std::string data;
                 data.resize(count);
@@ -1828,15 +2116,17 @@ private:
             case cudaMemcpyDeviceToDevice: {
                 CUdeviceptr dst_ptr = 0;
                 CUdeviceptr src_ptr = 0;
+                uint64_t dst_offset = 0;
+                uint64_t src_offset = 0;
                 {
                     std::lock_guard<std::mutex> session_lock(session->mu);
-                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count);
-                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count);
+                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count, &dst_offset);
+                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count, &src_offset);
                     if (!dst || !src || !ResolveStreamLocked(*session, request.stream_id(), &stream)) {
                         return CUDA_ERROR_INVALID_VALUE;
                     }
-                    dst_ptr = dst->device_ptr;
-                    src_ptr = src->device_ptr;
+                    dst_ptr = dst->device_ptr + dst_offset;
+                    src_ptr = src->device_ptr + src_offset;
                 }
                 CUresult result = cuMemcpyDtoDAsync(dst_ptr, src_ptr, count, stream);
                 if (result == CUDA_SUCCESS && !async_request) {
@@ -1902,14 +2192,15 @@ private:
         switch (request.kind()) {
             case cudaMemcpyHostToDevice: {
                 CUdeviceptr dst_ptr = 0;
+                uint64_t dst_offset = 0;
                 {
                     const auto lookup_start = Clock::now();
                     std::lock_guard<std::mutex> session_lock(session->mu);
-                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count);
+                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count, &dst_offset);
                     if (!dst) {
                         return CUDA_ERROR_INVALID_VALUE;
                     }
-                    dst_ptr = dst->device_ptr;
+                    dst_ptr = dst->device_ptr + dst_offset;
                     allocation_lookup_us = ElapsedUs(lookup_start);
                 }
                 const auto submit_start = Clock::now();
@@ -1925,14 +2216,15 @@ private:
             }
             case cudaMemcpyDeviceToHost: {
                 CUdeviceptr src_ptr = 0;
+                uint64_t src_offset = 0;
                 {
                     const auto lookup_start = Clock::now();
                     std::lock_guard<std::mutex> session_lock(session->mu);
-                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count);
+                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count, &src_offset);
                     if (!src) {
                         return CUDA_ERROR_INVALID_VALUE;
                     }
-                    src_ptr = src->device_ptr;
+                    src_ptr = src->device_ptr + src_offset;
                     allocation_lookup_us = ElapsedUs(lookup_start);
                 }
                 const auto submit_start = Clock::now();
@@ -1949,16 +2241,18 @@ private:
             case cudaMemcpyDeviceToDevice: {
                 CUdeviceptr dst_ptr = 0;
                 CUdeviceptr src_ptr = 0;
+                uint64_t dst_offset = 0;
+                uint64_t src_offset = 0;
                 {
                     const auto lookup_start = Clock::now();
                     std::lock_guard<std::mutex> session_lock(session->mu);
-                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count);
-                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count);
+                    const Allocation *dst = FindAllocationLocked(*session, request.dst_device_ptr(), count, &dst_offset);
+                    const Allocation *src = FindAllocationLocked(*session, request.src_device_ptr(), count, &src_offset);
                     if (!dst || !src) {
                         return CUDA_ERROR_INVALID_VALUE;
                     }
-                    dst_ptr = dst->device_ptr;
-                    src_ptr = src->device_ptr;
+                    dst_ptr = dst->device_ptr + dst_offset;
+                    src_ptr = src->device_ptr + src_offset;
                     allocation_lookup_us = ElapsedUs(lookup_start);
                 }
                 const auto submit_start = Clock::now();
@@ -1978,7 +2272,7 @@ private:
     }
 
     std::atomic<uint64_t> next_session_id_{1};
-    std::atomic<uint64_t> next_virtual_ptr_id_{1};
+    std::atomic<uint64_t> next_virtual_ptr_{kVirtualPtrBase + kVirtualPtrStride};
     std::atomic<uint64_t> next_virtual_stream_id_{1};
     std::atomic<uint64_t> next_virtual_event_id_{1};
     std::atomic<uint64_t> next_module_id_{1};

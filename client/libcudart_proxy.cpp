@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -40,6 +41,7 @@ thread_local dim3 tls_grid_dim(1, 1, 1);
 thread_local dim3 tls_block_dim(1, 1, 1);
 thread_local size_t tls_shared_mem = 0;
 thread_local cudaStream_t tls_stream = nullptr;
+thread_local uint64_t tls_trace_tag = vgpu_shm::kTraceDefault;
 
 cudaError_t SetLastError(cudaError_t error) {
     tls_last_error = error;
@@ -110,6 +112,22 @@ uint64_t ElapsedUs(Clock::time_point start, Clock::time_point end = Clock::now()
         std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 }
 
+uint64_t NowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count());
+}
+
+bool RingTraceRequested() {
+    const char *env = std::getenv("VGPU_RING_TRACE");
+    return env && std::strcmp(env, "1") == 0;
+}
+
+bool InitTraceRequested() {
+    const char *env = std::getenv("VGPU_INIT_TRACE");
+    return env && std::strcmp(env, "1") == 0;
+}
+
 void CopyStringToCudaName(char *dst, size_t dst_size, const std::string &src) {
     if (dst_size == 0) {
         return;
@@ -119,7 +137,145 @@ void CopyStringToCudaName(char *dst, size_t dst_size, const std::string &src) {
     dst[n] = '\0';
 }
 
+const char *RingOpName(uint64_t op) {
+    switch (op) {
+        case vgpu_shm::kRingOpMemcpyShm:
+            return "memcpy_shm";
+        case vgpu_shm::kRingOpMemcpyD2D:
+            return "d2d";
+        case vgpu_shm::kRingOpDeviceSynchronize:
+            return "device_sync";
+        case vgpu_shm::kRingOpStreamSynchronize:
+            return "stream_sync";
+        case vgpu_shm::kRingOpEventSynchronize:
+            return "event_sync";
+        case vgpu_shm::kRingOpEventQuery:
+            return "event_query";
+        case vgpu_shm::kRingOpLaunchKernel:
+            return "launch_kernel";
+        default:
+            return "unknown";
+    }
+}
+
+const char *TraceTagName(uint64_t tag) {
+    switch (tag) {
+        case vgpu_shm::kTraceEmptyStreamSync:
+            return "empty_stream_sync";
+        case vgpu_shm::kTraceD2DSync:
+            return "d2d_sync";
+        case vgpu_shm::kTraceKernelSync:
+            return "kernel_sync";
+        case vgpu_shm::kTraceBatchDrainSync:
+            return "batch_drain_sync";
+        default:
+            return "default";
+    }
+}
+
+struct RingTraceBucket {
+    uint64_t count = 0;
+    uint64_t queue_depth_sum = 0;
+    uint64_t queue_depth_max = 0;
+    uint64_t submit_to_dequeue_ns = 0;
+    uint64_t dequeue_to_context_ns = 0;
+    uint64_t context_ns = 0;
+    uint64_t context_to_lookup_ns = 0;
+    uint64_t lookup_ns = 0;
+    uint64_t lookup_to_rebuild_ns = 0;
+    uint64_t rebuild_ns = 0;
+    uint64_t rebuild_to_driver_ns = 0;
+    uint64_t driver_api_ns = 0;
+    uint64_t driver_to_complete_ns = 0;
+    uint64_t complete_to_client_ns = 0;
+    uint64_t total_ns = 0;
+};
+
+class RingTraceStats {
+public:
+    void Record(const vgpu_shm::RingEntry &entry) {
+        if (!RingTraceRequested() ||
+            entry.t_client_submit_ns == 0 ||
+            entry.t_server_dequeue_ns == 0 ||
+            entry.t_context_start_ns == 0 ||
+            entry.t_context_end_ns == 0 ||
+            entry.t_lookup_start_ns == 0 ||
+            entry.t_lookup_end_ns == 0 ||
+            entry.t_rebuild_start_ns == 0 ||
+            entry.t_rebuild_end_ns == 0 ||
+            entry.t_driver_start_ns == 0 ||
+            entry.t_driver_end_ns == 0 ||
+            entry.t_server_complete_ns == 0 ||
+            entry.t_client_done_ns == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        const uint64_t key = (entry.trace_tag << 32) ^ entry.op;
+        RingTraceBucket &bucket = buckets_[key];
+        ++bucket.count;
+        bucket.queue_depth_sum += entry.queue_depth_at_submit;
+        bucket.queue_depth_max = std::max(bucket.queue_depth_max, entry.queue_depth_at_submit);
+        bucket.submit_to_dequeue_ns += Delta(entry.t_client_submit_ns, entry.t_server_dequeue_ns);
+        bucket.dequeue_to_context_ns += Delta(entry.t_server_dequeue_ns, entry.t_context_start_ns);
+        bucket.context_ns += Delta(entry.t_context_start_ns, entry.t_context_end_ns);
+        bucket.context_to_lookup_ns += Delta(entry.t_context_end_ns, entry.t_lookup_start_ns);
+        bucket.lookup_ns += Delta(entry.t_lookup_start_ns, entry.t_lookup_end_ns);
+        bucket.lookup_to_rebuild_ns += Delta(entry.t_lookup_end_ns, entry.t_rebuild_start_ns);
+        bucket.rebuild_ns += Delta(entry.t_rebuild_start_ns, entry.t_rebuild_end_ns);
+        bucket.rebuild_to_driver_ns += Delta(entry.t_rebuild_end_ns, entry.t_driver_start_ns);
+        bucket.driver_api_ns += Delta(entry.t_driver_start_ns, entry.t_driver_end_ns);
+        bucket.driver_to_complete_ns += Delta(entry.t_driver_end_ns, entry.t_server_complete_ns);
+        bucket.complete_to_client_ns += Delta(entry.t_server_complete_ns, entry.t_client_done_ns);
+        bucket.total_ns += Delta(entry.t_client_submit_ns, entry.t_client_done_ns);
+    }
+
+    void Print() {
+        if (!RingTraceRequested()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto &entry : buckets_) {
+            const RingTraceBucket &b = entry.second;
+            if (b.count == 0) {
+                continue;
+            }
+            const uint64_t op = entry.first & 0xffffffffull;
+            const uint64_t tag = entry.first >> 32;
+            const double n = static_cast<double>(b.count);
+            std::fprintf(
+                stderr,
+                "ring_trace op=%s tag=%s count=%llu queue_depth_avg=%.3f queue_depth_max=%llu submit_to_dequeue_us=%.3f dequeue_to_context_us=%.3f context_us=%.3f context_to_lookup_us=%.3f lookup_us=%.3f lookup_to_rebuild_us=%.3f rebuild_us=%.3f rebuild_to_driver_us=%.3f driver_api_us=%.3f driver_to_complete_us=%.3f complete_to_client_us=%.3f total_us=%.3f\n",
+                RingOpName(op),
+                TraceTagName(tag),
+                static_cast<unsigned long long>(b.count),
+                static_cast<double>(b.queue_depth_sum) / n,
+                static_cast<unsigned long long>(b.queue_depth_max),
+                static_cast<double>(b.submit_to_dequeue_ns) / n / 1000.0,
+                static_cast<double>(b.dequeue_to_context_ns) / n / 1000.0,
+                static_cast<double>(b.context_ns) / n / 1000.0,
+                static_cast<double>(b.context_to_lookup_ns) / n / 1000.0,
+                static_cast<double>(b.lookup_ns) / n / 1000.0,
+                static_cast<double>(b.lookup_to_rebuild_ns) / n / 1000.0,
+                static_cast<double>(b.rebuild_ns) / n / 1000.0,
+                static_cast<double>(b.rebuild_to_driver_ns) / n / 1000.0,
+                static_cast<double>(b.driver_api_ns) / n / 1000.0,
+                static_cast<double>(b.driver_to_complete_ns) / n / 1000.0,
+                static_cast<double>(b.complete_to_client_ns) / n / 1000.0,
+                static_cast<double>(b.total_ns) / n / 1000.0);
+        }
+    }
+
+private:
+    static uint64_t Delta(uint64_t start, uint64_t end) {
+        return end >= start ? end - start : 0;
+    }
+
+    std::mutex mu_;
+    std::unordered_map<uint64_t, RingTraceBucket> buckets_;
+};
+
 void ShutdownAtExit();
+RingTraceStats &RingTrace();
 
 struct FatbinWrapper {
     uint32_t magic;
@@ -391,6 +547,7 @@ public:
             return cudaSuccess;
         }
 
+        const auto init_start = Clock::now();
         const std::string address = ServerAddress();
         grpc::ChannelArguments args;
         args.SetMaxReceiveMessageSize(-1);
@@ -398,7 +555,9 @@ public:
         auto channel = grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args);
         stub_ = vgpu::VgpuRuntime::NewStub(channel);
 
+        const auto shm_start = Clock::now();
         PrepareShmForSession();
+        const uint64_t shm_prepare_us = ElapsedUs(shm_start);
 
         vgpu::CreateSessionRequest request;
         request.set_client_pid(static_cast<uint32_t>(getpid()));
@@ -411,7 +570,9 @@ public:
 
         vgpu::CreateSessionReply reply;
         grpc::ClientContext context;
+        const auto create_session_start = Clock::now();
         grpc::Status status = stub_->CreateSession(&context, request, &reply);
+        const uint64_t create_session_us = ElapsedUs(create_session_start);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] CreateSession RPC failed: "
                       << status.error_message() << std::endl;
@@ -429,7 +590,9 @@ public:
         shm_.enabled = reply.shm_enabled() && shm_.base;
         shm_.data_offset = static_cast<size_t>(reply.shm_data_offset());
         shm_.data_size = static_cast<size_t>(reply.shm_data_size());
+        const auto configure_shm_start = Clock::now();
         ConfigureShmArena();
+        const uint64_t configure_shm_us = ElapsedUs(configure_shm_start);
         if (!shm_.enabled) {
             CleanupShm();
         }
@@ -438,10 +601,23 @@ public:
             std::atexit(ShutdownAtExit);
             shutdown_registered_ = true;
         }
-        std::cerr << "[cudart_proxy] connected to " << address
-                  << " session=" << session_id_
-                  << " data_plane=" << (shm_.enabled ? "shm" : "grpc")
-                  << std::endl;
+        if (DetailedPerfRequested()) {
+            std::cerr << "[cudart_proxy] connected to " << address
+                      << " session=" << session_id_
+                      << " data_plane=" << (shm_.enabled ? "shm" : "grpc")
+                      << std::endl;
+        }
+        if (InitTraceRequested()) {
+            std::fprintf(
+                stderr,
+                "init_trace side=client op=EnsureSession total_us=%llu shm_prepare_us=%llu create_session_rpc_us=%llu configure_shm_arena_us=%llu shm_enabled=%d data_size=%llu\n",
+                static_cast<unsigned long long>(ElapsedUs(init_start)),
+                static_cast<unsigned long long>(shm_prepare_us),
+                static_cast<unsigned long long>(create_session_us),
+                static_cast<unsigned long long>(configure_shm_us),
+                shm_.enabled ? 1 : 0,
+                static_cast<unsigned long long>(shm_.data_size));
+        }
         return cudaSuccess;
     }
 
@@ -1089,11 +1265,15 @@ public:
     }
 
     void **RegisterFatBinary(const void *fat_cubin) {
+        const auto total_start = Clock::now();
         const uint64_t local_handle = next_local_module_handle_++;
         ModuleInfo module;
+        const auto extract_start = Clock::now();
         module.fatbin = ExtractFatbinData(fat_cubin);
+        const uint64_t extract_us = ElapsedUs(extract_start);
 
         cudaError_t err = EnsureSession();
+        uint64_t register_rpc_us = 0;
         if (err == cudaSuccess && !module.fatbin.empty()) {
             vgpu::RegisterModuleRequest request;
             request.set_session_id(session_id_);
@@ -1101,12 +1281,16 @@ public:
 
             vgpu::RegisterModuleReply reply;
             grpc::ClientContext context;
+            const auto rpc_start = Clock::now();
             grpc::Status status = stub_->RegisterModule(&context, request, &reply);
+            register_rpc_us = ElapsedUs(rpc_start);
             if (status.ok() && reply.cuda_error() == cudaSuccess) {
                 module.server_module_id = reply.module_id();
-                std::cerr << "[cudart_proxy] registered module id="
-                          << module.server_module_id
-                          << " fatbin_bytes=" << module.fatbin.size() << std::endl;
+                if (DetailedPerfRequested()) {
+                    std::cerr << "[cudart_proxy] registered module id="
+                              << module.server_module_id
+                              << " fatbin_bytes=" << module.fatbin.size() << std::endl;
+                }
             } else {
                 std::cerr << "[cudart_proxy] RegisterModule failed: "
                           << (status.ok() ? reply.message() : status.error_message()) << std::endl;
@@ -1116,6 +1300,14 @@ public:
         {
             std::lock_guard<std::mutex> lock(reg_mu_);
             modules_.emplace(local_handle, std::move(module));
+        }
+        if (InitTraceRequested()) {
+            std::fprintf(
+                stderr,
+                "init_trace side=client op=RegisterFatBinary total_us=%llu extract_fatbin_us=%llu register_module_rpc_us=%llu\n",
+                static_cast<unsigned long long>(ElapsedUs(total_start)),
+                static_cast<unsigned long long>(extract_us),
+                static_cast<unsigned long long>(register_rpc_us));
         }
         return reinterpret_cast<void **>(static_cast<uintptr_t>(local_handle));
     }
@@ -1147,9 +1339,18 @@ public:
             kernel_name,
             param_it->second,
         };
-        std::cerr << "[cudart_proxy] registered kernel name=" << kernel_name
-                  << " module=" << module.server_module_id
-                  << " params=" << param_it->second.size() << std::endl;
+        if (InitTraceRequested()) {
+            std::fprintf(
+                stderr,
+                "init_trace side=client op=RegisterFunction kernel=%s params=%zu\n",
+                kernel_name.c_str(),
+                param_it->second.size());
+        }
+        if (DetailedPerfRequested()) {
+            std::cerr << "[cudart_proxy] registered kernel name=" << kernel_name
+                      << " module=" << module.server_module_id
+                      << " params=" << param_it->second.size() << std::endl;
+        }
     }
 
     void UnregisterFatBinary(void **fat_cubin_handle) {
@@ -1515,7 +1716,7 @@ private:
     }
 
     template <typename FillFn>
-    bool SubmitRingEntry(FillFn fill, cudaError_t *out, uint64_t *ring_wait_us) {
+    bool SubmitRingEntry(FillFn fill, cudaError_t *out, uint64_t *ring_wait_us, bool wait_completion = true) {
         const auto ring_start = Clock::now();
         if (!shm_.ring_enabled || !shm_.base) {
             return false;
@@ -1528,12 +1729,14 @@ private:
         }
 
         uint64_t head = 0;
+        uint64_t tail_snapshot = 0;
         for (;;) {
             if (vgpu_shm::LoadAcquire(&header->stop) != 0) {
                 return false;
             }
             head = vgpu_shm::LoadAcquire(&header->head);
             const uint64_t tail = vgpu_shm::LoadAcquire(&header->tail);
+            tail_snapshot = tail;
             if (head - tail < vgpu_shm::kRingCapacity) {
                 break;
             }
@@ -1545,8 +1748,19 @@ private:
         vgpu_shm::StoreRelaxed(&entry->done, 0);
         entry->cuda_error = cudaErrorUnknown;
         entry->seq = head + 1;
+        entry->trace_tag = tls_trace_tag;
+        entry->queue_depth_at_submit = head - tail_snapshot;
         fill(entry);
+        entry->t_client_submit_ns = NowNs();
         vgpu_shm::StoreRelease(&header->head, head + 1);
+
+        if (!wait_completion) {
+            *out = cudaSuccess;
+            if (ring_wait_us) {
+                *ring_wait_us = ElapsedUs(ring_start);
+            }
+            return true;
+        }
 
         while (vgpu_shm::LoadAcquire(&entry->done) == 0) {
             if (vgpu_shm::LoadAcquire(&header->stop) != 0) {
@@ -1554,6 +1768,8 @@ private:
             }
             std::this_thread::yield();
         }
+        entry->t_client_done_ns = NowNs();
+        RingTrace().Record(*entry);
         *out = FromWireError(entry->cuda_error);
         if (ring_wait_us) {
             *ring_wait_us = ElapsedUs(ring_start);
@@ -1598,7 +1814,7 @@ private:
             entry->src_device_ptr = src_device_ptr;
             entry->count = static_cast<uint64_t>(count);
             entry->stream_id = stream_id;
-        }, out, nullptr);
+        }, out, nullptr, !async);
     }
 
     bool SubmitSyncRing(uint64_t op, uintptr_t stream_id, uintptr_t event_id, cudaError_t *out) {
@@ -1650,7 +1866,7 @@ private:
                 cursor += kernel.param_sizes[i];
             }
             entry->arg_bytes = static_cast<uint32_t>(cursor);
-        }, out, nullptr);
+        }, out, nullptr, false);
     }
 
     cudaError_t MemcpyViaShm(
@@ -1798,8 +2014,14 @@ RuntimeProxyClient &Client() {
     return *client;
 }
 
+RingTraceStats &RingTrace() {
+    static auto *trace = new RingTraceStats;
+    return *trace;
+}
+
 void ShutdownAtExit() {
     Client().Shutdown();
+    RingTrace().Print();
 }
 
 }  // namespace
@@ -1954,6 +2176,10 @@ extern "C" cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEv
 
 extern "C" cudaError_t cudaEventDestroy(cudaEvent_t event) {
     return SetLastError(Client().EventDestroy(event));
+}
+
+extern "C" void vgpuSetTraceLabel(uint64_t label) {
+    tls_trace_tag = label;
 }
 
 extern "C" void **__cudaRegisterFatBinary(void *fatCubin) {

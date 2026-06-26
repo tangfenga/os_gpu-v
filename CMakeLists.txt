@@ -72,6 +72,14 @@ target_link_libraries(vgpu_client_probe
         vgpu_proto
 )
 
+add_executable(driver_api_benchmark
+    tools/driver_api_benchmark.cpp
+)
+target_link_libraries(driver_api_benchmark
+    PRIVATE
+        CUDA::cuda_driver
+)
+
 add_library(cudart_proxy SHARED
     client/libcudart_proxy.cpp
 )
