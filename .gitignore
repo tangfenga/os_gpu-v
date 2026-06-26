@@ -1,0 +1,13 @@
+build/
+docs/
+.agents/
+.codex/
+.claude/
+
+*.o
+*.so
+*.a
+*.out
+*.d
+*.log
+*~

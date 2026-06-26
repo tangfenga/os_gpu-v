@@ -1,0 +1,19 @@
+#include <stdio.h>
+
+typedef int cudaError_t;
+
+cudaError_t cudaDriverGetVersion(int *driverVersion);
+cudaError_t cudaRuntimeGetVersion(int *runtimeVersion);
+const char *cudaGetErrorString(cudaError_t error);
+
+int main(void) {
+    int driver = 0;
+    int runtime = 0;
+    cudaError_t err = cudaDriverGetVersion(&driver);
+    printf("cudaDriverGetVersion: err=%d (%s) version=%d\n",
+           err, cudaGetErrorString(err), driver);
+    err = cudaRuntimeGetVersion(&runtime);
+    printf("cudaRuntimeGetVersion: err=%d (%s) version=%d\n",
+           err, cudaGetErrorString(err), runtime);
+    return driver > 0 ? 0 : 1;
+}
