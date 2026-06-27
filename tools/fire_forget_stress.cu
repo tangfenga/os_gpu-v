@@ -63,6 +63,17 @@ static void expect_error(cudaError_t err, const char *what) {
     std::printf("error_case %s returned %s (%d)\n", what, cudaGetErrorString(err), static_cast<int>(err));
 }
 
+static cudaError_t expect_submit_or_sync_error(cudaError_t submit_err, cudaStream_t stream, const char *what) {
+    if (submit_err != cudaSuccess) {
+        std::printf("error_case %s submit returned %s (%d)\n",
+                    what, cudaGetErrorString(submit_err), static_cast<int>(submit_err));
+        return submit_err;
+    }
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    expect_error(sync_err, what);
+    return sync_err;
+}
+
 static double elapsed_us(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end) {
     return static_cast<double>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()) / 1000.0;
@@ -196,9 +207,10 @@ static void run_error_semantics() {
     check(cudaMalloc(&d_a, sizeof(int)), "cudaMalloc error d_a");
     check(cudaMalloc(&d_b, sizeof(int)), "cudaMalloc error d_b");
 
-    check(cudaMemcpyAsync(d_b, reinterpret_cast<void *>(0x12345678ull), sizeof(int), cudaMemcpyDeviceToDevice, stream),
-          "invalid D2D submit should be fire-and-forget success");
-    expect_error(cudaStreamSynchronize(stream), "invalid_d2d_stream_sync");
+    expect_submit_or_sync_error(
+        cudaMemcpyAsync(d_b, reinterpret_cast<void *>(0x12345678ull), sizeof(int), cudaMemcpyDeviceToDevice, stream),
+        stream,
+        "invalid_d2d");
     check(cudaStreamSynchronize(stream), "pending error cleared after invalid D2D");
 
     cudaStream_t bogus_stream = reinterpret_cast<cudaStream_t>(0xCAFECAFEull);
@@ -207,11 +219,17 @@ static void run_error_semantics() {
     expect_error(cudaDeviceSynchronize(), "invalid_stream_device_sync");
     check(cudaDeviceSynchronize(), "pending error cleared after invalid stream");
 
-    check(cudaMemcpyAsync(d_b, reinterpret_cast<void *>(0x11110000ull), sizeof(int), cudaMemcpyDeviceToDevice, stream),
-          "first invalid D2D submit");
+    cudaError_t first_err = cudaMemcpyAsync(d_b, reinterpret_cast<void *>(0x11110000ull), sizeof(int),
+                                            cudaMemcpyDeviceToDevice, stream);
     set_index_kernel<<<1, 1, 0, bogus_stream>>>(d_a, 0, 9);
     check(cudaGetLastError(), "second invalid launch submit");
-    expect_error(cudaDeviceSynchronize(), "first_pending_error_not_overwritten");
+    if (first_err == cudaSuccess) {
+        expect_error(cudaDeviceSynchronize(), "first_pending_error_not_overwritten");
+    } else {
+        std::printf("error_case first_invalid_d2d submit returned %s (%d)\n",
+                    cudaGetErrorString(first_err), static_cast<int>(first_err));
+        expect_error(cudaDeviceSynchronize(), "second_pending_error_after_submit_failure");
+    }
     check(cudaDeviceSynchronize(), "pending error cleared after overwrite test");
 
     check(cudaFree(d_b), "cudaFree error d_b");

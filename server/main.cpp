@@ -189,6 +189,7 @@ struct SessionState {
     std::atomic<bool> ring_stop{false};
     std::atomic<int> pending_error{cudaSuccess};
     std::thread ring_thread;
+    uint64_t next_virtual_ptr = kVirtualPtrBase + kVirtualPtrStride;
     std::unordered_map<uint64_t, Allocation> allocations;
     std::unordered_map<uint64_t, CUmodule> modules;
     std::unordered_map<uint64_t, CUstream> streams;
@@ -528,7 +529,7 @@ public:
             return grpc::Status::OK;
         }
 
-        const uint64_t virtual_ptr = NextVirtualPtrLocked(static_cast<size_t>(request->size()));
+        uint64_t virtual_ptr = 0;
         {
             std::lock_guard<std::mutex> session_lock(session->mu);
             if (session->closing) {
@@ -537,6 +538,7 @@ public:
                 reply->set_message("session is closing");
                 return grpc::Status::OK;
             }
+            virtual_ptr = NextVirtualPtrLocked(*session, static_cast<size_t>(request->size()));
             session->allocations.emplace(
                 virtual_ptr,
                 Allocation{real_ptr, static_cast<size_t>(request->size())});
@@ -1967,12 +1969,14 @@ private:
         return CUDA_SUCCESS;
     }
 
-    uint64_t NextVirtualPtrLocked(size_t size) {
+    uint64_t NextVirtualPtrLocked(SessionState &session, size_t size) {
         constexpr uint64_t kVirtualPtrAlignment = 0x1000ull;
         const uint64_t aligned_size =
             (static_cast<uint64_t>(size) + kVirtualPtrAlignment - 1) & ~(kVirtualPtrAlignment - 1);
         const uint64_t span = aligned_size + kVirtualPtrAlignment;
-        return next_virtual_ptr_.fetch_add(span);
+        const uint64_t virtual_ptr = session.next_virtual_ptr;
+        session.next_virtual_ptr += span;
+        return virtual_ptr;
     }
 
     uint64_t NextVirtualStreamLocked() {
@@ -2272,7 +2276,6 @@ private:
     }
 
     std::atomic<uint64_t> next_session_id_{1};
-    std::atomic<uint64_t> next_virtual_ptr_{kVirtualPtrBase + kVirtualPtrStride};
     std::atomic<uint64_t> next_virtual_stream_id_{1};
     std::atomic<uint64_t> next_virtual_event_id_{1};
     std::atomic<uint64_t> next_module_id_{1};
