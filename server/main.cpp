@@ -4,8 +4,6 @@
 #include <cuda_runtime_api.h>
 
 #include <fcntl.h>
-#include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -24,15 +22,27 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ring_worker.h"
+#include "session_manager.h"
 #include "../shared/vgpu_shm_ring.h"
 #include "vgpu.grpc.pb.h"
 
 namespace {
 
+using vgpu_server::Allocation;
+using vgpu_server::BindRingWorkerToCpu;
+using vgpu_server::FindAllocationLocked;
+using vgpu_server::NextVirtualPtrLocked;
+using vgpu_server::ResolveEventLocked;
+using vgpu_server::ResolveStreamLocked;
+using vgpu_server::RingIdleBackoff;
+using vgpu_server::SessionManager;
+using vgpu_server::SessionState;
+using vgpu_server::ShmMapping;
+using vgpu_server::TouchSession;
+
 constexpr int kCudaSuccess = 0;
 constexpr int kCudaErrorInvalidValue = 1;
-constexpr uint64_t kVirtualPtrBase = 0xCADA00000000ull;
-constexpr uint64_t kVirtualPtrStride = 0x1000ull;
 constexpr uint64_t kVirtualStreamBase = 0xCADA10000000ull;
 constexpr uint64_t kVirtualStreamStride = 0x1000ull;
 constexpr uint64_t kVirtualEventBase = 0xCADA20000000ull;
@@ -158,44 +168,6 @@ void LogPerf(
               << " elapsed_us=" << elapsed_us << std::endl;
 }
 
-struct Allocation {
-    CUdeviceptr device_ptr = 0;
-    size_t size = 0;
-};
-
-struct ShmMapping {
-    std::string name;
-    int fd = -1;
-    void *base = nullptr;
-    size_t size = 0;
-    void *pinned_base = nullptr;
-    size_t pinned_size = 0;
-    bool pinned = false;
-};
-
-struct SessionState {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool closing = false;
-    uint64_t session_id = 0;
-    uint32_t client_pid = 0;
-    uint64_t memory_limit = 0;
-    uint64_t memory_used = 0;
-    uint32_t active_ops = 0;
-    std::chrono::steady_clock::time_point last_seen = std::chrono::steady_clock::now();
-    CUstream default_stream = nullptr;
-    ShmMapping shm;
-    bool ring_enabled = false;
-    std::atomic<bool> ring_stop{false};
-    std::atomic<int> pending_error{cudaSuccess};
-    std::thread ring_thread;
-    uint64_t next_virtual_ptr = kVirtualPtrBase + kVirtualPtrStride;
-    std::unordered_map<uint64_t, Allocation> allocations;
-    std::unordered_map<uint64_t, CUmodule> modules;
-    std::unordered_map<uint64_t, CUstream> streams;
-    std::unordered_map<uint64_t, CUevent> events;
-};
-
 struct FatbinWrapper {
     unsigned int magic;
     unsigned int version;
@@ -221,7 +193,7 @@ public:
         const vgpu::CreateSessionRequest *request,
         vgpu::CreateSessionReply *reply) override {
         const auto total_start = Clock::now();
-        const uint64_t session_id = next_session_id_.fetch_add(1);
+        const uint64_t session_id = session_manager_.NextSessionId();
         CUstream default_stream = nullptr;
         ShmMapping shm;
         bool shm_enabled = false;
@@ -290,7 +262,7 @@ public:
             const auto pin_start = Clock::now();
             TryPinShmArenaLocked(session);
             pin_shm_us = ElapsedUs(pin_start);
-            sessions_.emplace(session_id, session);
+            session_manager_.Add(session);
         }
 
         if (session && session->ring_enabled) {
@@ -339,15 +311,7 @@ public:
         grpc::ServerContext *,
         const vgpu::DestroySessionRequest *request,
         vgpu::StatusReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-                sessions_.erase(it);
-            }
-        }
+        std::shared_ptr<SessionState> session = session_manager_.Remove(request->session_id());
         if (session) {
             CleanupSessionResources(session, "destroy");
         }
@@ -394,13 +358,13 @@ public:
         grpc::ServerContext *,
         const vgpu::GetDevicePropertiesRequest *request,
         vgpu::GetDevicePropertiesReply *reply) override {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (sessions_.find(request->session_id()) == sessions_.end()) {
+        if (!HasSession(request->session_id())) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
             return grpc::Status::OK;
         }
 
+        std::lock_guard<std::mutex> lock(mu_);
         CUresult result = EnsureCudaLocked();
         if (result != CUDA_SUCCESS) {
             reply->set_cuda_error(RuntimeError(result));
@@ -479,14 +443,7 @@ public:
             return grpc::Status::OK;
         }
 
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto session_it = sessions_.find(request->session_id());
-            if (session_it != sessions_.end()) {
-                session = session_it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -564,14 +521,7 @@ public:
             return grpc::Status::OK;
         }
 
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto session_it = sessions_.find(request->session_id());
-            if (session_it != sessions_.end()) {
-                session = session_it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -644,14 +594,7 @@ public:
             return grpc::Status::OK;
         }
 
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto session_it = sessions_.find(request->session_id());
-            if (session_it != sessions_.end()) {
-                session = session_it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -676,14 +619,7 @@ public:
         grpc::ServerContext *,
         const vgpu::DeviceSynchronizeRequest *request,
         vgpu::StatusReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -701,14 +637,7 @@ public:
         grpc::ServerContext *,
         const vgpu::StreamCreateRequest *request,
         vgpu::StreamCreateReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -753,14 +682,7 @@ public:
         grpc::ServerContext *,
         const vgpu::StreamDestroyRequest *request,
         vgpu::StatusReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -802,14 +724,7 @@ public:
         grpc::ServerContext *,
         const vgpu::StreamSynchronizeRequest *request,
         vgpu::StatusReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -842,14 +757,7 @@ public:
         grpc::ServerContext *,
         const vgpu::EventCreateRequest *request,
         vgpu::EventCreateReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -890,14 +798,7 @@ public:
         grpc::ServerContext *,
         const vgpu::EventRecordRequest *request,
         vgpu::StatusReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -968,14 +869,7 @@ public:
         grpc::ServerContext *,
         const vgpu::EventElapsedTimeRequest *request,
         vgpu::EventElapsedTimeReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -1010,14 +904,7 @@ public:
         grpc::ServerContext *,
         const vgpu::EventDestroyRequest *request,
         vgpu::StatusReply *reply) override {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(request->session_id());
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -1060,14 +947,7 @@ public:
             return grpc::Status::OK;
         }
 
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto session_it = sessions_.find(request.session_id());
-            if (session_it != sessions_.end()) {
-                session = session_it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request.session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -1108,14 +988,7 @@ public:
             return grpc::Status::OK;
         }
 
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto session_it = sessions_.find(request->session_id());
-            if (session_it != sessions_.end()) {
-                session = session_it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -1181,14 +1054,7 @@ public:
         const vgpu::LaunchKernelRequest *request,
         vgpu::StatusReply *reply) override {
         const auto op_start = Clock::now();
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto session_it = sessions_.find(request->session_id());
-            if (session_it != sessions_.end()) {
-                session = session_it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -1382,14 +1248,27 @@ private:
     }
 
     CUresult DoDeviceSynchronize(const std::shared_ptr<SessionState> &session) {
-        (void)session;
         CUresult result = EnsureCudaLocked();
         if (result != CUDA_SUCCESS) {
             return result;
         }
-        result = cuCtxSynchronize();
-        if (result != CUDA_SUCCESS) {
-            return result;
+
+        std::vector<CUstream> streams;
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            if (session->default_stream) {
+                streams.push_back(session->default_stream);
+            }
+            for (const auto &entry : session->streams) {
+                streams.push_back(entry.second);
+            }
+        }
+
+        for (CUstream stream : streams) {
+            result = cuStreamSynchronize(stream);
+            if (result != CUDA_SUCCESS) {
+                return result;
+            }
         }
         const int pending = TakePendingError(session);
         return pending == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
@@ -1670,40 +1549,18 @@ private:
         return pending == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
     }
 
-    void TryBindRingWorker(uint64_t session_id) {
-#if defined(__linux__)
-        const unsigned int cpus = std::thread::hardware_concurrency();
-        if (cpus <= 1) {
-            return;
-        }
-        const uint64_t base = ReadUint64Env("VGPU_RING_CPU_BASE", 1);
-        const int cpu = static_cast<int>((base + session_id - 1) % cpus);
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(cpu, &set);
-        const int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-        if (DetailedPerfRequested()) {
-            std::cout << "[vgpu] op=BindRingWorker sid=" << session_id
-                      << " cpu=" << cpu
-                      << " result=" << rc << std::endl;
-        }
-#else
-        (void)session_id;
-#endif
-    }
-
     void RingWorkerLoop(std::shared_ptr<SessionState> session) {
         if (!session || !session->shm.base) {
             return;
         }
-        TryBindRingWorker(session->session_id);
+        BindRingWorkerToCpu(session->session_id);
         auto *header = vgpu_shm::Header(session->shm.base);
         auto *entries = vgpu_shm::Entries(session->shm.base);
         if (!vgpu_shm::HeaderLooksReady(header)) {
             return;
         }
 
-        uint32_t idle_iters = 0;
+        RingIdleBackoff idle_backoff;
         while (!session->ring_stop.load()) {
             uint64_t tail = vgpu_shm::LoadAcquire(&header->tail);
             const uint64_t head = vgpu_shm::LoadAcquire(&header->head);
@@ -1711,22 +1568,10 @@ private:
                 if (vgpu_shm::LoadAcquire(&header->stop) != 0) {
                     break;
                 }
-                ++idle_iters;
-                if (idle_iters < 1000) {
-                    continue;
-                }
-                if (idle_iters < 5000) {
-                    std::this_thread::yield();
-                    continue;
-                }
-                if (idle_iters < 10000) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(1));
-                    continue;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds(20));
+                idle_backoff.Wait();
                 continue;
             }
-            idle_iters = 0;
+            idle_backoff.Reset();
 
             while (tail < head && !session->ring_stop.load()) {
                 const auto op_start = Clock::now();
@@ -1893,29 +1738,9 @@ private:
         while (!stop_reaper_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-            std::vector<std::shared_ptr<SessionState>> expired;
             const auto now = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> lock(mu_);
-                for (auto it = sessions_.begin(); it != sessions_.end();) {
-                    std::shared_ptr<SessionState> session = it->second;
-                    bool should_expire = false;
-                    {
-                        std::lock_guard<std::mutex> session_lock(session->mu);
-                        const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - session->last_seen).count();
-                        should_expire = !session->closing &&
-                            idle_ms >= static_cast<int64_t>(session_timeout_ms_);
-                    }
-                    if (should_expire) {
-                        expired.push_back(session);
-                        it = sessions_.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-
+            std::vector<std::shared_ptr<SessionState>> expired =
+                session_manager_.RemoveExpired(now, session_timeout_ms_);
             for (const auto &session : expired) {
                 CleanupSessionResources(session, "timeout");
             }
@@ -1923,13 +1748,20 @@ private:
     }
 
     bool HasSession(uint64_t session_id) {
-        std::lock_guard<std::mutex> lock(mu_);
-        auto it = sessions_.find(session_id);
-        if (it == sessions_.end()) {
+        auto session = session_manager_.Find(session_id);
+        if (!session) {
             return false;
         }
-        TouchSession(it->second);
+        TouchSession(session);
         return true;
+    }
+
+    std::shared_ptr<SessionState> FindSession(uint64_t session_id) {
+        auto session = session_manager_.Find(session_id);
+        if (session) {
+            TouchSession(session);
+        }
+        return session;
     }
 
     CUresult EnsureCudaLocked() {
@@ -1969,16 +1801,6 @@ private:
         return CUDA_SUCCESS;
     }
 
-    uint64_t NextVirtualPtrLocked(SessionState &session, size_t size) {
-        constexpr uint64_t kVirtualPtrAlignment = 0x1000ull;
-        const uint64_t aligned_size =
-            (static_cast<uint64_t>(size) + kVirtualPtrAlignment - 1) & ~(kVirtualPtrAlignment - 1);
-        const uint64_t span = aligned_size + kVirtualPtrAlignment;
-        const uint64_t virtual_ptr = session.next_virtual_ptr;
-        session.next_virtual_ptr += span;
-        return virtual_ptr;
-    }
-
     uint64_t NextVirtualStreamLocked() {
         const uint64_t id = next_virtual_stream_id_.fetch_add(1);
         return kVirtualStreamBase + id * kVirtualStreamStride;
@@ -1989,41 +1811,12 @@ private:
         return kVirtualEventBase + id * kVirtualEventStride;
     }
 
-    bool ResolveStreamLocked(SessionState &session, uint64_t stream_id, CUstream *stream) {
-        if (stream_id == 0) {
-            *stream = session.default_stream;
-            return *stream != nullptr;
-        }
-        auto it = session.streams.find(stream_id);
-        if (it == session.streams.end()) {
-            return false;
-        }
-        *stream = it->second;
-        return true;
-    }
-
-    bool ResolveEventLocked(SessionState &session, uint64_t event_id, CUevent *event) {
-        auto it = session.events.find(event_id);
-        if (it == session.events.end()) {
-            return false;
-        }
-        *event = it->second;
-        return true;
-    }
-
     grpc::Status ResolveEventForRequest(
         uint64_t session_id,
         uint64_t event_id,
         CUevent *event,
         vgpu::StatusReply *reply) {
-        std::shared_ptr<SessionState> session;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(session_id);
-            if (it != sessions_.end()) {
-                session = it->second;
-            }
-        }
+        std::shared_ptr<SessionState> session = FindSession(session_id);
         if (!session) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("session not found");
@@ -2042,28 +1835,6 @@ private:
         reply->set_cuda_error(kCudaSuccess);
         reply->set_message("event resolved");
         return grpc::Status::OK;
-    }
-
-    const Allocation *FindAllocationLocked(
-        SessionState &session,
-        uint64_t virtual_ptr,
-        size_t count,
-        uint64_t *offset_out = nullptr) {
-        for (const auto &entry : session.allocations) {
-            const uint64_t base = entry.first;
-            const Allocation &allocation = entry.second;
-            if (virtual_ptr < base) {
-                continue;
-            }
-            const uint64_t offset = virtual_ptr - base;
-            if (offset <= allocation.size && count <= allocation.size - offset) {
-                if (offset_out) {
-                    *offset_out = offset;
-                }
-                return &allocation;
-            }
-        }
-        return nullptr;
     }
 
     CUresult DoMemcpy(
@@ -2275,13 +2046,12 @@ private:
         }
     }
 
-    std::atomic<uint64_t> next_session_id_{1};
     std::atomic<uint64_t> next_virtual_stream_id_{1};
     std::atomic<uint64_t> next_virtual_event_id_{1};
     std::atomic<uint64_t> next_module_id_{1};
+    SessionManager session_manager_;
     std::mutex mu_;
     std::mutex cuda_mu_;
-    std::unordered_map<uint64_t, std::shared_ptr<SessionState>> sessions_;
     std::atomic<bool> stop_reaper_{false};
     std::thread reaper_thread_;
     uint64_t session_timeout_ms_ = kDefaultSessionTimeoutMs;
