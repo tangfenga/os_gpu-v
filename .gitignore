@@ -1,0 +1,21 @@
+build/
+.agents/
+.codex/
+.claude/
+
+*.o
+*.so
+*.a
+*.out
+*.d
+*.log
+*~
+
+# Local editor and cache files
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+
+# Generated protobuf/grpc outputs are created under build/.
+generated/

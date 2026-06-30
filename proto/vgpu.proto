@@ -1,0 +1,233 @@
+syntax = "proto3";
+
+package vgpu;
+
+service VgpuRuntime {
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionReply);
+  rpc DestroySession(DestroySessionRequest) returns (StatusReply);
+
+  rpc GetDeviceCount(GetDeviceCountRequest) returns (GetDeviceCountReply);
+  rpc GetDeviceProperties(GetDevicePropertiesRequest) returns (GetDevicePropertiesReply);
+
+  rpc Malloc(MallocRequest) returns (MallocReply);
+  rpc Free(FreeRequest) returns (StatusReply);
+  rpc Memcpy(MemcpyRequest) returns (MemcpyReply);
+  rpc MemcpyAsync(MemcpyRequest) returns (MemcpyReply);
+  rpc MemcpyShm(MemcpyShmRequest) returns (StatusReply);
+  rpc DeviceSynchronize(DeviceSynchronizeRequest) returns (StatusReply);
+  rpc StreamCreate(StreamCreateRequest) returns (StreamCreateReply);
+  rpc StreamDestroy(StreamDestroyRequest) returns (StatusReply);
+  rpc StreamSynchronize(StreamSynchronizeRequest) returns (StatusReply);
+  rpc EventCreate(EventCreateRequest) returns (EventCreateReply);
+  rpc EventRecord(EventRecordRequest) returns (StatusReply);
+  rpc EventSynchronize(EventSynchronizeRequest) returns (StatusReply);
+  rpc EventQuery(EventQueryRequest) returns (StatusReply);
+  rpc EventElapsedTime(EventElapsedTimeRequest) returns (EventElapsedTimeReply);
+  rpc EventDestroy(EventDestroyRequest) returns (StatusReply);
+
+  rpc RegisterModule(RegisterModuleRequest) returns (RegisterModuleReply);
+  rpc LaunchKernel(LaunchKernelRequest) returns (StatusReply);
+}
+
+message StatusReply {
+  int32 cuda_error = 1;
+  string message = 2;
+}
+
+message CreateSessionRequest {
+  uint32 client_pid = 1;
+  string client_name = 2;
+  uint64 requested_memory_limit = 3;
+  string shm_name = 4;
+  uint64 shm_size = 5;
+}
+
+message CreateSessionReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  uint64 session_id = 3;
+  bool shm_enabled = 4;
+  uint64 shm_data_offset = 5;
+  uint64 shm_data_size = 6;
+}
+
+message DestroySessionRequest {
+  uint64 session_id = 1;
+}
+
+message GetDeviceCountRequest {
+  uint64 session_id = 1;
+}
+
+message GetDeviceCountReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  int32 count = 3;
+}
+
+message GetDevicePropertiesRequest {
+  uint64 session_id = 1;
+  int32 device = 2;
+}
+
+message GetDevicePropertiesReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  string name = 3;
+  uint64 total_global_mem = 4;
+  int32 multi_processor_count = 5;
+  int32 major = 6;
+  int32 minor = 7;
+  int32 warp_size = 8;
+  int32 max_threads_per_block = 9;
+  repeated int32 max_threads_dim = 10;
+  repeated int32 max_grid_size = 11;
+  int32 clock_rate = 12;
+  int32 memory_clock_rate = 13;
+  int32 memory_bus_width = 14;
+}
+
+message MallocRequest {
+  uint64 session_id = 1;
+  uint64 size = 2;
+}
+
+message MallocReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  uint64 device_ptr = 3;
+}
+
+message FreeRequest {
+  uint64 session_id = 1;
+  uint64 device_ptr = 2;
+}
+
+message MemcpyRequest {
+  uint64 session_id = 1;
+  uint64 dst_device_ptr = 2;
+  uint64 src_device_ptr = 3;
+  uint64 count = 4;
+  int32 kind = 5;
+  bytes host_data = 6;
+  uint64 stream_id = 7;
+  bool async = 8;
+}
+
+message MemcpyReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  bytes host_data = 3;
+}
+
+message MemcpyShmRequest {
+  uint64 session_id = 1;
+  uint64 dst_device_ptr = 2;
+  uint64 src_device_ptr = 3;
+  uint64 count = 4;
+  int32 kind = 5;
+  uint64 shm_offset = 6;
+  uint64 stream_id = 7;
+  bool async = 8;
+}
+
+message DeviceSynchronizeRequest {
+  uint64 session_id = 1;
+}
+
+message StreamCreateRequest {
+  uint64 session_id = 1;
+  uint32 flags = 2;
+}
+
+message StreamCreateReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  uint64 stream_id = 3;
+}
+
+message StreamDestroyRequest {
+  uint64 session_id = 1;
+  uint64 stream_id = 2;
+}
+
+message StreamSynchronizeRequest {
+  uint64 session_id = 1;
+  uint64 stream_id = 2;
+}
+
+message EventCreateRequest {
+  uint64 session_id = 1;
+  uint32 flags = 2;
+}
+
+message EventCreateReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  uint64 event_id = 3;
+}
+
+message EventRecordRequest {
+  uint64 session_id = 1;
+  uint64 event_id = 2;
+  uint64 stream_id = 3;
+}
+
+message EventSynchronizeRequest {
+  uint64 session_id = 1;
+  uint64 event_id = 2;
+}
+
+message EventQueryRequest {
+  uint64 session_id = 1;
+  uint64 event_id = 2;
+}
+
+message EventElapsedTimeRequest {
+  uint64 session_id = 1;
+  uint64 start_event_id = 2;
+  uint64 stop_event_id = 3;
+}
+
+message EventElapsedTimeReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  float milliseconds = 3;
+}
+
+message EventDestroyRequest {
+  uint64 session_id = 1;
+  uint64 event_id = 2;
+}
+
+message RegisterModuleRequest {
+  uint64 session_id = 1;
+  bytes fatbin = 2;
+}
+
+message RegisterModuleReply {
+  int32 cuda_error = 1;
+  string message = 2;
+  uint64 module_id = 3;
+}
+
+message Dim3 {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 z = 3;
+}
+
+message KernelArg {
+  bytes data = 1;
+}
+
+message LaunchKernelRequest {
+  uint64 session_id = 1;
+  uint64 module_id = 2;
+  string kernel_name = 3;
+  Dim3 grid_dim = 4;
+  Dim3 block_dim = 5;
+  uint64 shared_mem = 6;
+  repeated KernelArg args = 7;
+  uint64 stream_id = 8;
+}
