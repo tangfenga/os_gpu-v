@@ -4,6 +4,8 @@
 
 赛题要求以 GPU 运行进程为基本虚拟化单位，截获客户机中用户 GPU 进程运行的算子信息，并转发到宿主机 GPU 上运行；同时通过并发操作、数据同步和数据通路优化降低迁移与转发开销。本项目围绕这个目标实现了 Runtime API proxy、per-session 资源隔离、virtual pointer、shared memory 数据面和 SPSC ring fast path。
 
+![os_gpu-v project cover](docs/assets/project-cover.png)
+
 ## 项目信息
 
 | 项目 | 内容 |
@@ -47,7 +49,9 @@ tools/
   concurrency/  多进程并发和跨 session 测试
   benchmark/    性能基准测试
   scripts/     Python 验收验证脚本
-docs/       project report
+docs/
+  assets/     README 和报告使用的项目配图
+  project_report.md
 ```
 
 ## 依赖
@@ -172,3 +176,5 @@ nvcc -std=c++17 -cudart shared tools/concurrency/cross_session_sync_test.cu -o /
 ## 文档
 
 - [项目报告](docs/project_report.md)
+- [项目封面图](docs/assets/project-cover.png)
+- [session 隔离示意图](docs/assets/session-isolation.png)
