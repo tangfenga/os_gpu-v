@@ -120,7 +120,7 @@ stream 和 event 相关测试由 `stream_async_smoke.cu`、`event_timing_smoke.c
 
 ## 8. 分工和协作
 
-本项目按照三人本科生小组的方式推进，成员为黄昱嘉、程昶斌、石锐。分工大体按 client、server、测试文档三条线展开，但很多接口需要一起联调。
+本项目按照三人小组的方式推进，成员为黄昱嘉、程昶斌、石锐。分工大体按 client、server、测试文档三条线展开，但很多接口需要一起联调。
 
 黄昱嘉主要负责 client 侧代理库，包括 `LD_PRELOAD` 拦截、Runtime API 包装、session 初始化、shared memory block 管理、kernel registration 记录、last error 语义和部分测试联调。client 侧的难点在于既要让用户程序看到接近 CUDA Runtime 的行为，又要把真实执行转移到 server。
 
