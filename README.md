@@ -24,7 +24,7 @@ server/     vGPU server, session manager, ring worker
 proto/      gRPC/protobuf service definition
 shared/     shared-memory ring structures
 tools/      acceptance tests and benchmarks
-docs/       design report, evaluation report, final report
+docs/       project report
 ```
 
 ## Submission Scope
@@ -36,7 +36,7 @@ The submitted project entry points are:
 - `proto/vgpu.proto`
 - `client/`, `server/`, `shared/`
 - acceptance tests and benchmarks under `tools/`
-- three submission documents under `docs/`
+- project report under `docs/`
 
 The repository excludes local probes, one-off debugging programs, generated build output, and learning notes.
 
@@ -141,8 +141,6 @@ For the full 10-minute stability run:
   --stability-seconds 600
 ```
 
-## Reports
+## Report
 
-- [Design](docs/design.md)
-- [Evaluation](docs/evaluation.md)
-- [Final Report](docs/final_report.md)
+- [Project Report](docs/project_report.md)
