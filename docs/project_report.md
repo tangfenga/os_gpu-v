@@ -42,6 +42,8 @@
 
 系统整体由四部分组成：client 代理库、gRPC 协议层、server 资源管理与执行层、shared memory/ring fast path。
 
+![系统架构图](assets/arch.png)
+
 client 侧的核心是 `libcudart_proxy.so`。它导出 CUDA Runtime API 同名符号，用户程序运行时会因为 `LD_PRELOAD` 优先进入我们的代理函数。例如用户调用 `cudaMalloc(&ptr, size)` 时，代理库不会在 client 进程中分配真实 GPU 显存，而是向 server 发送 malloc 请求。server 分配真实 GPU memory 后返回一个 virtual pointer，client 把这个 virtual pointer 填回用户传入的 `ptr`。
 
 server 侧的核心是 session。每个 client 进程连接 server 时创建一个独立 session。session 中保存 allocation table、module table、stream table、event table、private default stream、pending error、shared memory mapping 和 ring worker。这样，同一台 server 上可以同时服务多个用户进程，每个进程都只看到自己的虚拟 GPU 资源。
