@@ -62,29 +62,7 @@ H2D/D2H 走 shared memory，避免把大块数据放入 protobuf bytes。kernel 
 
 ## 5. 验收结果
 
-| 验收项 | 结果 |
-| --- | --- |
-| Runtime API 拦截 | pass |
-| vector add | pass |
-| matrix multiply | pass |
-| H2D/D2H/D2D memcpy | pass |
-| stream async | pass |
-| event timing | pass |
-| 双进程并发 | pass |
-| 跨 session 同步隔离 | pass |
-| ring wrap-around stress | pass |
-| 负例错误处理 | pass |
-| 10 分钟稳定性 | pass |
-
-矩阵乘法稳态性能：
-
-```text
-native median-of-medians ~= 230.343 us
-proxy  median-of-medians ~= 281.283 us
-proxy/native ~= 1.221x
-```
-
-虚拟化损耗约 22.1%，满足 50% 以内的性能目标。
+项目完成了 CUDA Runtime API 拦截、向量加法、矩阵乘法、H2D/D2H/D2D 拷贝、stream async、event timing、双进程并发、跨 session 同步隔离、ring wrap-around stress、负例错误处理和 10 分钟稳定性测试。矩阵乘法稳态测试中，native Runtime 的 median-of-medians 约为 230.343 us，proxy Runtime 约为 281.283 us，proxy/native 约为 1.221x，虚拟化损耗约 22.1%，满足赛题中性能损耗控制在 50% 以内的目标。
 
 ## 6. 工程结构
 
@@ -96,9 +74,3 @@ shared/     shared-memory ring definitions
 tools/      acceptance tests and benchmarks
 docs/       design, evaluation, final report
 ```
-
-## 7. 后续扩展
-
-当前数据面使用 POSIX shared memory。部署到容器或虚拟机场景时，可以将该数据面替换为容器共享内存、IVSHMEM 或 virtio-shm。控制面仍可沿用 gRPC，client 侧仍通过 Runtime API proxy 保持应用透明。
-
-API 覆盖可以按 CUDA Runtime API 手册继续扩展：新增 proxy symbol、协议字段和 server Driver API handler。ring worker 也可以进一步加入 futex/eventfd 唤醒机制，以降低空闲 CPU 占用。
