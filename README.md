@@ -4,8 +4,6 @@
 
 赛题要求以 GPU 运行进程为基本虚拟化单位，截获客户机中用户 GPU 进程运行的算子信息，并转发到宿主机 GPU 上运行；同时通过并发操作、数据同步和数据通路优化降低迁移与转发开销。本项目围绕这个目标实现了 Runtime API proxy、per-session 资源隔离、virtual pointer、shared memory 数据面和 SPSC ring fast path。
 
-![system architecture](docs/assets/system-architecture.svg)
-
 ## 项目信息
 
 | 项目 | 内容 |
@@ -30,11 +28,7 @@
 
 ## 数据路径
 
-项目把不同类型的请求拆成三条路径，避免所有数据都挤在普通 RPC 中：
-
-![data paths](docs/assets/data-paths.svg)
-
-低频控制请求通过 gRPC 传递结构化信息；H2D/D2H 大块数据通过 shared memory 传递；高频小命令通过 per-session SPSC ring 提交给 server worker。
+项目把不同类型的请求拆成三条路径，避免所有数据都挤在普通 RPC 中。低频控制请求通过 gRPC 传递结构化信息；H2D/D2H 大块数据通过 shared memory 传递；高频小命令通过 per-session SPSC ring 提交给 server worker。
 
 ## 仓库结构
 
@@ -155,6 +149,3 @@ nvcc -std=c++17 -cudart shared tools/cross_session_sync_test.cu -o /tmp/vgpu_cro
 ## 文档
 
 - [项目报告](docs/project_report.md)
-- [系统架构图](docs/assets/system-architecture.svg)
-- [数据路径图](docs/assets/data-paths.svg)
-- [session 资源模型图](docs/assets/session-model.svg)
