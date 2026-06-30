@@ -451,6 +451,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = EnsureCudaLocked();
         if (result != CUDA_SUCCESS) {
@@ -496,6 +497,13 @@ public:
                 return grpc::Status::OK;
             }
             virtual_ptr = NextVirtualPtrLocked(*session, static_cast<size_t>(request->size()));
+            if (virtual_ptr == 0) {
+                cuMemFree(real_ptr);
+                reply->set_cuda_error(cudaErrorMemoryAllocation);
+                reply->set_message("virtual address space exhausted");
+                LogPerf("Malloc", request->session_id(), request->size(), 0, cudaErrorMemoryAllocation, op_start);
+                return grpc::Status::OK;
+            }
             session->allocations.emplace(
                 virtual_ptr,
                 Allocation{real_ptr, static_cast<size_t>(request->size())});
@@ -529,6 +537,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUdeviceptr real_ptr = 0;
         size_t freed_size = 0;
@@ -543,12 +552,6 @@ public:
             }
             real_ptr = alloc_it->second.device_ptr;
             freed_size = alloc_it->second.size;
-            session->allocations.erase(alloc_it);
-            if (session->memory_used >= freed_size) {
-                session->memory_used -= freed_size;
-            } else {
-                session->memory_used = 0;
-            }
         }
 
         CUresult result = EnsureCudaLocked();
@@ -558,7 +561,21 @@ public:
         if (result != CUDA_SUCCESS) {
             reply->set_cuda_error(RuntimeError(result));
             reply->set_message(DriverErrorString(result));
+            LogPerf("Free", request->session_id(), freed_size, 0, RuntimeError(result), op_start);
             return grpc::Status::OK;
+        }
+
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            auto alloc_it = session->allocations.find(request->device_ptr());
+            if (alloc_it != session->allocations.end()) {
+                session->allocations.erase(alloc_it);
+                if (session->memory_used >= freed_size) {
+                    session->memory_used -= freed_size;
+                } else {
+                    session->memory_used = 0;
+                }
+            }
         }
 
         reply->set_cuda_error(kCudaSuccess);
@@ -602,6 +619,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = EnsureCudaLocked();
         if (result == CUDA_SUCCESS) {
@@ -626,6 +644,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = DoDeviceSynchronize(session);
         reply->set_cuda_error(RuntimeError(result));
@@ -644,6 +663,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = EnsureCudaLocked();
         CUstream stream = nullptr;
@@ -689,6 +709,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
         if (request->stream_id() == 0) {
             reply->set_cuda_error(kCudaErrorInvalidValue);
             reply->set_message("cannot destroy default stream");
@@ -705,7 +726,6 @@ public:
                 return grpc::Status::OK;
             }
             stream = it->second;
-            session->streams.erase(it);
         }
 
         CUresult result = EnsureCudaLocked();
@@ -714,6 +734,10 @@ public:
         }
         if (result == CUDA_SUCCESS) {
             result = cuStreamDestroy(stream);
+        }
+        if (result == CUDA_SUCCESS) {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            session->streams.erase(request->stream_id());
         }
         reply->set_cuda_error(RuntimeError(result));
         reply->set_message(result == CUDA_SUCCESS ? "stream destroyed" : DriverErrorString(result));
@@ -731,6 +755,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUstream stream = nullptr;
         bool ok = false;
@@ -764,6 +789,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = EnsureCudaLocked();
         CUevent event = nullptr;
@@ -805,6 +831,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUevent event = nullptr;
         CUstream stream = nullptr;
@@ -876,6 +903,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUevent start = nullptr;
         CUevent stop = nullptr;
@@ -911,23 +939,28 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUevent event = nullptr;
+        uint64_t event_id = request->event_id();
         {
             std::lock_guard<std::mutex> session_lock(session->mu);
-            auto it = session->events.find(request->event_id());
+            auto it = session->events.find(event_id);
             if (it == session->events.end()) {
                 reply->set_cuda_error(cudaErrorInvalidResourceHandle);
                 reply->set_message("event not found");
                 return grpc::Status::OK;
             }
             event = it->second;
-            session->events.erase(it);
         }
 
         CUresult result = EnsureCudaLocked();
         if (result == CUDA_SUCCESS) {
             result = cuEventDestroy(event);
+        }
+        if (result == CUDA_SUCCESS) {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            session->events.erase(event_id);
         }
         reply->set_cuda_error(RuntimeError(result));
         reply->set_message(result == CUDA_SUCCESS ? "event destroyed" : DriverErrorString(result));
@@ -955,6 +988,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = EnsureCudaLocked();
         if (result != CUDA_SUCCESS) {
@@ -995,6 +1029,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUresult result = EnsureCudaLocked();
         uint64_t module_load_us = 0;
@@ -1061,6 +1096,7 @@ public:
             return grpc::Status::OK;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
 
         CUmodule module = nullptr;
         CUstream stream = nullptr;
@@ -1165,6 +1201,18 @@ public:
     }
 
 private:
+    struct SessionOpGuard {
+        SessionOpGuard(VgpuRuntimeService *svc, const std::shared_ptr<SessionState> &s)
+            : service(svc), session(s) {
+            if (session) service->BeginOp(session);
+        }
+        ~SessionOpGuard() {
+            if (session) service->EndOp(session);
+        }
+        VgpuRuntimeService *service;
+        std::shared_ptr<SessionState> session;
+    };
+
     static uint64_t ReadSessionTimeoutMs() {
         const char *env = std::getenv("VGPU_SESSION_TIMEOUT_MS");
         if (!env || env[0] == '\0') {
@@ -1184,6 +1232,25 @@ private:
         }
         std::lock_guard<std::mutex> lock(session->mu);
         session->last_seen = std::chrono::steady_clock::now();
+    }
+
+    void BeginOp(const std::shared_ptr<SessionState> &session) {
+        if (!session) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(session->mu);
+        ++session->active_ops;
+    }
+
+    void EndOp(const std::shared_ptr<SessionState> &session) {
+        if (!session) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->active_ops > 0) {
+            --session->active_ops;
+        }
+        session->cv.notify_all();
     }
 
     void TryPinShmArenaLocked(const std::shared_ptr<SessionState> &session) {
@@ -1599,6 +1666,7 @@ private:
                 int cuda_error = kCudaErrorInvalidValue;
                 if (entry->op == vgpu_shm::kRingOpMemcpyShm) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     vgpu::MemcpyShmRequest request;
                     request.set_session_id(session->session_id);
                     request.set_dst_device_ptr(entry->dst_device_ptr);
@@ -1625,6 +1693,7 @@ private:
                         op_start);
                 } else if (entry->op == vgpu_shm::kRingOpMemcpyD2D) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     CUresult result = DoMemcpyD2DRingFast(session, entry);
                     cuda_error = RuntimeError(result);
                     LogPerf(
@@ -1636,28 +1705,33 @@ private:
                         op_start);
                 } else if (entry->op == vgpu_shm::kRingOpDeviceSynchronize) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     entry->t_driver_start_ns = NowNs();
                     cuda_error = RuntimeError(DoDeviceSynchronize(session));
                     entry->t_driver_end_ns = NowNs();
                     LogPerf("DeviceSynchronizeRing", session->session_id, 0, 0, cuda_error, op_start);
                 } else if (entry->op == vgpu_shm::kRingOpStreamSynchronize) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     cuda_error = RuntimeError(DoStreamSynchronizeRingFast(session, entry));
                     LogPerf("StreamSynchronizeRing", session->session_id, 0, entry->stream_id, cuda_error, op_start);
                 } else if (entry->op == vgpu_shm::kRingOpEventSynchronize) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     entry->t_driver_start_ns = NowNs();
                     cuda_error = RuntimeError(DoEventSynchronize(session, entry->event_id));
                     entry->t_driver_end_ns = NowNs();
                     LogPerf("EventSynchronizeRing", session->session_id, 0, 0, cuda_error, op_start);
                 } else if (entry->op == vgpu_shm::kRingOpEventQuery) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     entry->t_driver_start_ns = NowNs();
                     cuda_error = RuntimeError(DoEventQuery(session, entry->event_id));
                     entry->t_driver_end_ns = NowNs();
                     LogPerf("EventQueryRing", session->session_id, 0, 0, cuda_error, op_start);
                 } else if (entry->op == vgpu_shm::kRingOpLaunchKernel) {
                     TouchSession(session);
+        SessionOpGuard guard(this, session);
                     cuda_error = RuntimeError(DoLaunchKernelRingFast(session, entry));
                     LogPerf("LaunchKernelRing", session->session_id, 0, entry->stream_id, cuda_error, op_start);
                 } else {
@@ -1686,55 +1760,66 @@ private:
         StopRingWorker(session);
 
         const uint64_t sid = session->session_id;
+
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            if (session->closing && session->active_ops == 0 &&
+                session->default_stream == nullptr &&
+                session->allocations.empty() && session->modules.empty() &&
+                session->streams.empty() && session->events.empty()) {
+                return;
+            }
+            session->closing = true;
+        }
+
         CUresult init_result = EnsureCudaLocked();
-        if (init_result != CUDA_SUCCESS) {
+        const bool cuda_ok = (init_result == CUDA_SUCCESS);
+        if (!cuda_ok) {
             std::cerr << "[vgpu] op=CleanupSession sid=" << sid
                       << " reason=" << reason
-                      << " cuda_init_error=" << DriverErrorString(init_result) << std::endl;
-            return;
+                      << " cuda_init_error=" << DriverErrorString(init_result)
+                      << " (continuing with non-CUDA cleanup)" << std::endl;
         }
 
-        std::lock_guard<std::mutex> session_lock(session->mu);
-        if (session->closing && session->default_stream == nullptr &&
-            session->allocations.empty() && session->modules.empty() &&
-            session->streams.empty() && session->events.empty()) {
-            return;
-        }
-        session->closing = true;
+        if (cuda_ok) {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            if (session->default_stream) {
+                cuStreamSynchronize(session->default_stream);
+            }
+            for (const auto &entry : session->streams) {
+                cuStreamSynchronize(entry.second);
+            }
+            for (const auto &entry : session->streams) {
+                cuStreamDestroy(entry.second);
+            }
+            session->streams.clear();
 
-        if (session->default_stream) {
-            cuStreamSynchronize(session->default_stream);
-        }
-        for (const auto &entry : session->streams) {
-            cuStreamSynchronize(entry.second);
-        }
-        for (const auto &entry : session->streams) {
-            cuStreamDestroy(entry.second);
-        }
-        session->streams.clear();
+            for (const auto &entry : session->events) {
+                cuEventDestroy(entry.second);
+            }
+            session->events.clear();
 
-        for (const auto &entry : session->events) {
-            cuEventDestroy(entry.second);
-        }
-        session->events.clear();
+            if (session->default_stream) {
+                cuStreamDestroy(session->default_stream);
+                session->default_stream = nullptr;
+            }
 
-        if (session->default_stream) {
-            cuStreamDestroy(session->default_stream);
-            session->default_stream = nullptr;
+            for (const auto &entry : session->allocations) {
+                cuMemFree(entry.second.device_ptr);
+            }
+            session->allocations.clear();
+            session->memory_used = 0;
+
+            for (const auto &entry : session->modules) {
+                cuModuleUnload(entry.second);
+            }
+            session->modules.clear();
         }
 
-        for (const auto &entry : session->allocations) {
-            cuMemFree(entry.second.device_ptr);
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            UnpinShmArenaLocked(session);
         }
-        session->allocations.clear();
-        session->memory_used = 0;
-
-        for (const auto &entry : session->modules) {
-            cuModuleUnload(entry.second);
-        }
-        session->modules.clear();
-
-        UnpinShmArenaLocked(session);
 
         if (session->shm.base) {
             munmap(session->shm.base, session->shm.size);
@@ -1775,6 +1860,7 @@ private:
             return false;
         }
         TouchSession(session);
+        SessionOpGuard guard(this, session);
         return true;
     }
 
@@ -1782,6 +1868,7 @@ private:
         auto session = session_manager_.Find(session_id);
         if (session) {
             TouchSession(session);
+        SessionOpGuard guard(this, session);
         }
         return session;
     }

@@ -102,7 +102,8 @@ public:
                 std::lock_guard<std::mutex> session_lock(session->mu);
                 const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - session->last_seen).count();
-                should_expire = !session->closing && idle_ms >= static_cast<int64_t>(timeout_ms);
+                should_expire = !session->closing && session->active_ops == 0 &&
+                    idle_ms >= static_cast<int64_t>(timeout_ms);
             }
             if (should_expire) {
                 expired.push_back(session);
@@ -134,6 +135,10 @@ inline uint64_t NextVirtualPtrLocked(SessionState &session, size_t size) {
         (static_cast<uint64_t>(size) + kVirtualPtrAlignment - 1) & ~(kVirtualPtrAlignment - 1);
     const uint64_t span = aligned_size + kVirtualPtrAlignment;
     const uint64_t virtual_ptr = session.next_virtual_ptr;
+    // 检查回绕：如果 span 超过剩余地址空间，返回 0 表示失败
+    if (virtual_ptr + span < virtual_ptr) {
+        return 0;
+    }
     session.next_virtual_ptr += span;
     return virtual_ptr;
 }

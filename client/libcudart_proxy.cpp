@@ -7,6 +7,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -284,6 +286,10 @@ struct FatbinWrapper {
     void *unused;
 };
 
+void SetRpcDeadline(grpc::ClientContext &context);
+void AtForkPrepare();
+void AtForkChild();
+
 struct KernelInfo {
     uint64_t module_id = 0;
     std::string kernel_name;
@@ -541,6 +547,31 @@ std::vector<size_t> ParseKernelParamSizes(const std::string &fatbin, const std::
 
 class RuntimeProxyClient {
 public:
+    void LockAll() {
+        mu_.lock();
+        reg_mu_.lock();
+        event_mu_.lock();
+        shm_.mu.lock();
+        shm_.ring_mu.lock();
+    }
+
+    void HandleForkChild() {
+        initialized_ = false;
+        session_id_ = 0;
+        ring_dead_.store(true);
+        stop_keepalive_.store(true);
+        stub_.reset();
+        CleanupShm();
+        ClearEventFences();
+        mu_.unlock();
+        reg_mu_.unlock();
+        event_mu_.unlock();
+        shm_.mu.unlock();
+        shm_.ring_mu.unlock();
+        modules_.clear();
+        kernels_.clear();
+    }
+
     void StartKeepaliveThread() {
         if (!stop_keepalive_.load()) {
             return;
@@ -610,6 +641,7 @@ public:
 
         vgpu::CreateSessionReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         const auto create_session_start = Clock::now();
         grpc::Status status = stub_->CreateSession(&context, request, &reply);
         const uint64_t create_session_us = ElapsedUs(create_session_start);
@@ -640,6 +672,7 @@ public:
         initialized_ = true;
         if (!shutdown_registered_) {
             std::atexit(ShutdownAtExit);
+            pthread_atfork(AtForkPrepare, nullptr, AtForkChild);
             shutdown_registered_ = true;
         }
         if (DetailedPerfRequested()) {
@@ -675,6 +708,7 @@ public:
         request.set_session_id(session_id_);
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->DestroySession(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] DestroySession RPC failed: "
@@ -694,6 +728,7 @@ public:
         request.set_session_id(session_id_);
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->Keepalive(&context, request, &reply);
         if (!status.ok()) {
             if (DetailedPerfRequested()) {
@@ -713,6 +748,7 @@ public:
         request.set_session_id(session_id_);
         vgpu::GetDeviceCountReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->GetDeviceCount(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] GetDeviceCount RPC failed: "
@@ -738,6 +774,7 @@ public:
         request.set_device(device);
         vgpu::GetDevicePropertiesReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->GetDeviceProperties(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] GetDeviceProperties RPC failed: "
@@ -782,6 +819,7 @@ public:
 
         vgpu::MallocReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->Malloc(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] Malloc RPC failed: "
@@ -808,6 +846,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->Free(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] Free RPC failed: "
@@ -995,6 +1034,7 @@ public:
 
         vgpu::MemcpyReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = async
             ? stub_->MemcpyAsync(&context, request, &reply)
             : stub_->Memcpy(&context, request, &reply);
@@ -1030,6 +1070,7 @@ public:
 
         vgpu::StreamCreateReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->StreamCreate(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] StreamCreate RPC failed: "
@@ -1058,6 +1099,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->StreamDestroy(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] StreamDestroy RPC failed: "
@@ -1096,6 +1138,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->StreamSynchronize(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] StreamSynchronize RPC failed: "
@@ -1121,6 +1164,7 @@ public:
 
         vgpu::EventCreateReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->EventCreate(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] EventCreate RPC failed: "
@@ -1151,6 +1195,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->EventRecord(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] EventRecord RPC failed: "
@@ -1189,6 +1234,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->EventSynchronize(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] EventSynchronize RPC failed: "
@@ -1226,6 +1272,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->EventQuery(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] EventQuery RPC failed: "
@@ -1252,6 +1299,7 @@ public:
 
         vgpu::EventElapsedTimeReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->EventElapsedTime(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] EventElapsedTime RPC failed: "
@@ -1280,6 +1328,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->EventDestroy(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] EventDestroy RPC failed: "
@@ -1312,6 +1361,7 @@ public:
         request.set_session_id(session_id_);
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->DeviceSynchronize(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] DeviceSynchronize RPC failed: "
@@ -1342,6 +1392,7 @@ public:
 
             vgpu::RegisterModuleReply reply;
             grpc::ClientContext context;
+        SetRpcDeadline(context);
             const auto rpc_start = Clock::now();
             grpc::Status status = stub_->RegisterModule(&context, request, &reply);
             register_rpc_us = ElapsedUs(rpc_start);
@@ -1484,6 +1535,7 @@ public:
 
         vgpu::StatusReply reply;
         grpc::ClientContext context;
+        SetRpcDeadline(context);
         grpc::Status status = stub_->LaunchKernel(&context, request, &reply);
         if (!status.ok()) {
             std::cerr << "[cudart_proxy] LaunchKernel RPC failed: "
@@ -1579,7 +1631,8 @@ private:
         shm_.cv.notify_all();
     }
 
-    bool CanUseShmMemcpy(size_t count, cudaMemcpyKind kind, bool async) const {
+    bool CanUseShmMemcpy(size_t count, cudaMemcpyKind kind, bool async) {
+        std::lock_guard<std::mutex> lock(shm_.mu);
         if (!shm_.enabled || !shm_.base || count < shm_.threshold || count > shm_.data_size ||
             shm_.block_size == 0 || shm_.block_free.empty()) {
             return false;
@@ -2035,6 +2088,7 @@ private:
             const auto rpc_start = Clock::now();
             vgpu::StatusReply reply;
             grpc::ClientContext context;
+        SetRpcDeadline(context);
             grpc::Status status = stub_->MemcpyShm(&context, request, &reply);
             rpc_wait_us = ElapsedUs(rpc_start);
             if (!status.ok()) {
@@ -2093,7 +2147,7 @@ private:
     bool initialized_ = false;
     bool shutdown_registered_ = false;
     uint64_t session_id_ = 0;
-    uint64_t next_local_module_handle_ = 1;
+    std::atomic<uint64_t> next_local_module_handle_{1};
     ShmState shm_;
     std::unique_ptr<vgpu::VgpuRuntime::Stub> stub_;
     std::unordered_map<uint64_t, ModuleInfo> modules_;
@@ -2114,9 +2168,116 @@ RingTraceStats &RingTrace() {
     return *trace;
 }
 
+void SetRpcDeadline(grpc::ClientContext &context) {
+    const char *env = std::getenv("VGPU_RPC_TIMEOUT_MS");
+    if (!env || env[0] == '\0') {
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
+        return;
+    }
+    char *end = nullptr;
+    const unsigned long long value = std::strtoull(env, &end, 10);
+    if (!end || *end != '\0' || value == 0) {
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
+        return;
+    }
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(static_cast<int64_t>(value)));
+}
+
+void AtForkPrepare() {
+    Client().LockAll();
+}
+
+void AtForkChild() {
+    Client().HandleForkChild();
+}
+
 void ShutdownAtExit() {
     Client().Shutdown();
     RingTrace().Print();
+}
+
+// 明确返回 cudaErrorNotSupported 防止静默回退到真实 libcudart
+extern "C" cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+    (void)devPtr; (void)value; (void)count;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t stream) {
+    (void)devPtr; (void)value; (void)count; (void)stream;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaMallocPitch(void **devPtr, size_t *pitch, size_t width, size_t height) {
+    (void)devPtr; (void)pitch; (void)width; (void)height;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaMalloc3D(cudaPitchedPtr *devPtr, cudaExtent extent) {
+    (void)devPtr; (void)extent;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaMemcpy3D(const cudaMemcpy3DParms *p) {
+    (void)p;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count, size_t offset, cudaMemcpyKind kind) {
+    (void)symbol; (void)src; (void)count; (void)offset; (void)kind;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count, size_t offset, cudaMemcpyKind kind) {
+    (void)dst; (void)symbol; (void)count; (void)offset; (void)kind;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaGetSymbolAddress(void **devPtr, const void *symbol) {
+    (void)devPtr; (void)symbol;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
+    (void)attributes; (void)ptr;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaFuncGetAttributes(cudaFuncAttributes *attr, const void *func) {
+    (void)attr; (void)func;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaFuncSetAttribute(const void *func, cudaFuncAttribute attr, int value) {
+    (void)func; (void)attr; (void)value;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaSetDeviceFlags(unsigned int flags) {
+    (void)flags;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaDeviceGetLimit(size_t *pValue, cudaLimit limit) {
+    (void)pValue; (void)limit;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaDeviceSetLimit(cudaLimit limit, size_t value) {
+    (void)limit; (void)value;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize) {
+    (void)numBlocks; (void)func; (void)blockSize; (void)dynamicSMemSize;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaProfilerStart(void) {
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaProfilerStop(void) {
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaGraphicsGLRegisterBuffer(cudaGraphicsResource **resource, unsigned int buffer, unsigned int flags) {
+    (void)resource; (void)buffer; (void)flags;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle, void *devPtr) {
+    (void)handle; (void)devPtr;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaIpcOpenMemHandle(void **devPtr, cudaIpcMemHandle_t handle, unsigned int flags) {
+    (void)devPtr; (void)handle; (void)flags;
+    return cudaErrorNotSupported;
+}
+extern "C" cudaError_t cudaGetDeviceFlags(unsigned int *flags) {
+    (void)flags;
+    return cudaErrorNotSupported;
 }
 
 }  // namespace
