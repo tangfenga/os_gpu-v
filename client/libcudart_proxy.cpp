@@ -541,6 +541,45 @@ std::vector<size_t> ParseKernelParamSizes(const std::string &fatbin, const std::
 
 class RuntimeProxyClient {
 public:
+    void StartKeepaliveThread() {
+        if (!stop_keepalive_.load()) {
+            return;
+        }
+        stop_keepalive_.store(false);
+        keepalive_thread_ = std::thread([this] { KeepaliveLoop(); });
+    }
+
+    void StopKeepaliveThread() {
+        stop_keepalive_.store(true);
+        if (keepalive_thread_.joinable()) {
+            keepalive_thread_.join();
+        }
+    }
+
+    void KeepaliveLoop() {
+        const uint64_t interval_us = ReadSessionTimeoutUs() / 4;
+        while (!stop_keepalive_.load()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
+            if (stop_keepalive_.load()) {
+                break;
+            }
+            KeepaliveRpc();
+        }
+    }
+
+    static uint64_t ReadSessionTimeoutUs() {
+        const char *env = std::getenv("VGPU_SESSION_TIMEOUT_MS");
+        if (!env || env[0] == '\0') {
+            return 30000 * 1000;
+        }
+        char *end = nullptr;
+        const unsigned long long value = std::strtoull(env, &end, 10);
+        if (!end || *end != '\0' || value == 0) {
+            return 30000 * 1000;
+        }
+        return value * 1000;
+    }
+
     cudaError_t EnsureSession() {
         std::lock_guard<std::mutex> lock(mu_);
         if (initialized_) {
@@ -597,6 +636,7 @@ public:
         if (!shm_.enabled) {
             CleanupShm();
         }
+        ring_dead_.store(false);
         initialized_ = true;
         if (!shutdown_registered_) {
             std::atexit(ShutdownAtExit);
@@ -619,6 +659,7 @@ public:
                 shm_.enabled ? 1 : 0,
                 static_cast<unsigned long long>(shm_.data_size));
         }
+        StartKeepaliveThread();
         return cudaSuccess;
     }
 
@@ -627,6 +668,8 @@ public:
         if (!initialized_ || !stub_) {
             return;
         }
+
+        StopKeepaliveThread();
 
         vgpu::DestroySessionRequest request;
         request.set_session_id(session_id_);
@@ -641,6 +684,23 @@ public:
         ClearEventFences();
         initialized_ = false;
         session_id_ = 0;
+    }
+
+    void KeepaliveRpc() {
+        if (!initialized_ || !stub_) {
+            return;
+        }
+        vgpu::KeepaliveRequest request;
+        request.set_session_id(session_id_);
+        vgpu::StatusReply reply;
+        grpc::ClientContext context;
+        grpc::Status status = stub_->Keepalive(&context, request, &reply);
+        if (!status.ok()) {
+            if (DetailedPerfRequested()) {
+                std::cerr << "[cudart_proxy] Keepalive RPC failed: "
+                          << status.error_message() << std::endl;
+            }
+        }
     }
 
     cudaError_t GetDeviceCount(int *count) {
@@ -1716,23 +1776,39 @@ private:
         shm_.cv.notify_all();
     }
 
+    static uint64_t ReadRingTimeoutUs() {
+        const char *env = std::getenv("VGPU_RING_TIMEOUT_US");
+        if (!env || env[0] == '\0') {
+            return 5000000;
+        }
+        char *end = nullptr;
+        const unsigned long long value = std::strtoull(env, &end, 10);
+        if (!end || *end != '\0' || value == 0) {
+            return 5000000;
+        }
+        return value;
+    }
+
     template <typename FillFn>
     bool SubmitRingEntry(FillFn fill, cudaError_t *out, uint64_t *ring_wait_us, bool wait_completion = true) {
         const auto ring_start = Clock::now();
-        if (!shm_.ring_enabled || !shm_.base) {
+        if (ring_dead_.load() || !shm_.ring_enabled || !shm_.base) {
             return false;
         }
         std::lock_guard<std::mutex> ring_lock(shm_.ring_mu);
         auto *header = vgpu_shm::Header(shm_.base);
         auto *entries = vgpu_shm::Entries(shm_.base);
         if (!vgpu_shm::HeaderLooksReady(header)) {
+            ring_dead_.store(true);
             return false;
         }
 
+        const uint64_t ring_timeout_us = ReadRingTimeoutUs();
         uint64_t head = 0;
         uint64_t tail_snapshot = 0;
         for (;;) {
             if (vgpu_shm::LoadAcquire(&header->stop) != 0) {
+                ring_dead_.store(true);
                 return false;
             }
             head = vgpu_shm::LoadAcquire(&header->head);
@@ -1740,6 +1816,13 @@ private:
             tail_snapshot = tail;
             if (head - tail < vgpu_shm::kRingCapacity) {
                 break;
+            }
+            if (ElapsedUs(ring_start) >= ring_timeout_us) {
+                ring_dead_.store(true);
+                if (DetailedPerfRequested()) {
+                    std::cerr << "[cudart_proxy] ring slot wait timeout, marking ring dead" << std::endl;
+                }
+                return false;
             }
             std::this_thread::yield();
         }
@@ -1765,6 +1848,14 @@ private:
 
         while (vgpu_shm::LoadAcquire(&entry->done) == 0) {
             if (vgpu_shm::LoadAcquire(&header->stop) != 0) {
+                ring_dead_.store(true);
+                return false;
+            }
+            if (ElapsedUs(ring_start) >= ring_timeout_us) {
+                ring_dead_.store(true);
+                if (DetailedPerfRequested()) {
+                    std::cerr << "[cudart_proxy] ring completion wait timeout, marking ring dead" << std::endl;
+                }
                 return false;
             }
             std::this_thread::yield();
@@ -2006,6 +2097,9 @@ private:
     ShmState shm_;
     std::unique_ptr<vgpu::VgpuRuntime::Stub> stub_;
     std::unordered_map<uint64_t, ModuleInfo> modules_;
+    std::atomic<bool> ring_dead_{false};
+    std::atomic<bool> stop_keepalive_{true};
+    std::thread keepalive_thread_;
     std::unordered_map<uintptr_t, KernelInfo> kernels_;
     std::unordered_map<uintptr_t, EventFence> event_fences_;
 };

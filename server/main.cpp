@@ -1145,6 +1145,25 @@ public:
         return grpc::Status::OK;
     }
 
+    grpc::Status Keepalive(
+        grpc::ServerContext *,
+        const vgpu::KeepaliveRequest *request,
+        vgpu::StatusReply *reply) override {
+        std::shared_ptr<SessionState> session = FindSession(request->session_id());
+        if (!session) {
+            reply->set_cuda_error(kCudaErrorInvalidValue);
+            reply->set_message("session not found");
+            return grpc::Status::OK;
+        }
+        // TouchSession 已经在 FindSession 中被调用
+        reply->set_cuda_error(kCudaSuccess);
+        reply->set_message("keepalive");
+        if (DetailedPerfRequested()) {
+            std::cout << "[vgpu] op=Keepalive sid=" << request->session_id() << std::endl;
+        }
+        return grpc::Status::OK;
+    }
+
 private:
     static uint64_t ReadSessionTimeoutMs() {
         const char *env = std::getenv("VGPU_SESSION_TIMEOUT_MS");
@@ -1725,6 +1744,9 @@ private:
         if (session->shm.fd >= 0) {
             close(session->shm.fd);
             session->shm.fd = -1;
+        }
+        if (!session->shm.name.empty()) {
+            shm_unlink(session->shm.name.c_str());
         }
         session->shm.name.clear();
 

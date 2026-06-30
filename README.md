@@ -17,6 +17,10 @@ The contest task asks for a lightweight GPU virtualization design that takes a r
 - H2D/D2H data transfer through POSIX shared memory
 - Kernel launch, D2D copy, and sync fast path through per-session SPSC rings
 - Stream/event virtualization
+- Client-side keepalive to prevent premature session reclamation
+- Ring operation timeout with automatic fallback to gRPC path
+- O(log n) virtual pointer lookup via ordered map (vs O(n) linear scan)
+- Server-side shared memory cleanup on session teardown
 - Multi-process concurrency tests
 - Performance and stability validation scripts
 
@@ -27,7 +31,12 @@ client/     CUDA Runtime proxy library
 server/     vGPU server, session manager, ring worker
 proto/      gRPC/protobuf service definition
 shared/     shared-memory ring structures
-tools/      acceptance tests and benchmarks
+tools/
+  smoke/      basic smoke tests (vector add, memcpy, stream, event, ...)
+  stress/     stress and negative tests
+  concurrency/  multi-process concurrency and cross-session tests
+  benchmark/    performance benchmarks
+  scripts/      Python acceptance validation scripts
 docs/       project report
 ```
 
@@ -98,7 +107,7 @@ VGPU_SERVER=127.0.0.1:50052 \
 If CUDA test binaries were not built by CMake, compile one manually with shared CUDA Runtime:
 
 ```bash
-nvcc -std=c++17 -cudart shared tools/vector_add_smoke.cu -o /tmp/vgpu_vector_add_smoke
+nvcc -std=c++17 -cudart shared tools/smoke/vector_add_smoke.cu -o /tmp/vgpu_vector_add_smoke
 ```
 
 Then run:
@@ -113,18 +122,18 @@ VGPU_SERVER=127.0.0.1:50052 \
 
 ## Acceptance Validation
 
-Build the acceptance binaries:
+Build the acceptance binaries (only needed when building without CMake CUDA tests):
 
 ```bash
-nvcc -std=c++17 -cudart shared tools/concurrent_worker.cu -o /tmp/vgpu_concurrent_worker
-nvcc -std=c++17 -cudart shared tools/matrix_mul_benchmark.cu -o /tmp/vgpu_matrix_mul_benchmark
-nvcc -std=c++17 -cudart shared tools/cross_session_sync_test.cu -o /tmp/vgpu_cross_session_sync_test
+nvcc -std=c++17 -cudart shared tools/concurrency/concurrent_worker.cu -o /tmp/vgpu_concurrent_worker
+nvcc -std=c++17 -cudart shared tools/benchmark/matrix_mul_benchmark.cu -o /tmp/vgpu_matrix_mul_benchmark
+nvcc -std=c++17 -cudart shared tools/concurrency/cross_session_sync_test.cu -o /tmp/vgpu_cross_session_sync_test
 ```
 
-Run the acceptance suite:
+Run the acceptance suite (using CMake-built binaries):
 
 ```bash
-./tools/run_acceptance_validation.py \
+./tools/scripts/run_acceptance_validation.py \
   --server 127.0.0.1:50052 \
   --proxy-lib "$PWD/build/libcudart_proxy.so" \
   --skip-stability
@@ -133,7 +142,7 @@ Run the acceptance suite:
 Run the cross-session synchronization test:
 
 ```bash
-./tools/run_cross_session_sync_test.py \
+./tools/scripts/run_cross_session_sync_test.py \
   --server 127.0.0.1:50052 \
   --proxy-lib "$PWD/build/libcudart_proxy.so"
 ```
@@ -141,11 +150,25 @@ Run the cross-session synchronization test:
 For the full 10-minute stability run:
 
 ```bash
-./tools/run_acceptance_validation.py \
+./tools/scripts/run_acceptance_validation.py \
   --server 127.0.0.1:50052 \
   --proxy-lib "$PWD/build/libcudart_proxy.so" \
   --stability-seconds 600
 ```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `VGPU_SERVER` | `127.0.0.1:50051` | Server address |
+| `VGPU_DATA_PLANE` | (empty, uses gRPC) | Set to `shm` to enable shared memory data path |
+| `VGPU_SHM_SIZE` | 67108864 (64 MB) | Shared memory arena size |
+| `VGPU_SHM_THRESHOLD` | 65536 (64 KB) | Minimum transfer size to use SHM path |
+| `VGPU_MEMORY_LIMIT` | 0 (unlimited) | Per-session GPU memory limit |
+| `VGPU_SESSION_TIMEOUT_MS` | 30000 | Session idle timeout before server reclamation (ms) |
+| `VGPU_RING_TIMEOUT_US` | 5000000 | Ring operation timeout (us); on expiry ring is disabled and falls back to gRPC |
+| `VGPU_PERF_DETAIL` | 0 | Set to `1` for detailed performance logging |
+| `VGPU_INIT_TRACE` | 0 | Set to `1` for initialization timing trace |
 
 ## Report
 

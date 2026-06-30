@@ -27,6 +27,12 @@ service VgpuRuntime {
 
   rpc RegisterModule(RegisterModuleRequest) returns (RegisterModuleReply);
   rpc LaunchKernel(LaunchKernelRequest) returns (StatusReply);
+
+  rpc Keepalive(KeepaliveRequest) returns (StatusReply);
+}
+
+message KeepaliveRequest {
+  uint64 session_id = 1;
 }
 
 message StatusReply {

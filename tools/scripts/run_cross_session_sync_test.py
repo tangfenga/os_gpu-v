@@ -38,7 +38,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="127.0.0.1:50052")
     parser.add_argument("--proxy-lib", default="./build/libcudart_proxy.so")
-    parser.add_argument("--binary", default="/tmp/vgpu_cross_session_sync_test")
+    parser.add_argument("--binary", default="./build/vgpu_cross_session_sync_test")
     parser.add_argument("--cycles", default="1500000000")
     parser.add_argument("--hold-ms", default="1500")
     parser.add_argument("--threshold-us", default="200000")

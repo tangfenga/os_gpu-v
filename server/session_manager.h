@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -55,7 +56,7 @@ struct SessionState {
     std::atomic<int> pending_error{cudaSuccess};
     std::thread ring_thread;
     uint64_t next_virtual_ptr = kVirtualPtrBase + kVirtualPtrStride;
-    std::unordered_map<uint64_t, Allocation> allocations;
+    std::map<uint64_t, Allocation> allocations;
     std::unordered_map<uint64_t, CUmodule> modules;
     std::unordered_map<uint64_t, CUstream> streams;
     std::unordered_map<uint64_t, CUevent> events;
@@ -164,19 +165,24 @@ inline const Allocation *FindAllocationLocked(
     uint64_t virtual_ptr,
     size_t count,
     uint64_t *offset_out = nullptr) {
-    for (const auto &entry : session.allocations) {
-        const uint64_t base = entry.first;
-        const Allocation &allocation = entry.second;
-        if (virtual_ptr < base) {
-            continue;
+    if (session.allocations.empty()) {
+        return nullptr;
+    }
+    // upper_bound 返回第一个 key > virtual_ptr 的迭代器
+    auto it = session.allocations.upper_bound(virtual_ptr);
+    // 前一个元素（如有）的 key <= virtual_ptr
+    if (it == session.allocations.begin()) {
+        return nullptr;
+    }
+    --it;
+    const uint64_t base = it->first;
+    const Allocation &allocation = it->second;
+    const uint64_t offset = virtual_ptr - base;
+    if (offset <= allocation.size && count <= allocation.size - offset) {
+        if (offset_out) {
+            *offset_out = offset;
         }
-        const uint64_t offset = virtual_ptr - base;
-        if (offset <= allocation.size && count <= allocation.size - offset) {
-            if (offset_out) {
-                *offset_out = offset;
-            }
-            return &allocation;
-        }
+        return &allocation;
     }
     return nullptr;
 }
