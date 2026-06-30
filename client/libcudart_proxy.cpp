@@ -552,6 +552,7 @@ public:
         grpc::ChannelArguments args;
         args.SetMaxReceiveMessageSize(-1);
         args.SetMaxSendMessageSize(-1);
+        args.SetInt("grpc.enable_http_proxy", 0);
         auto channel = grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args);
         stub_ = vgpu::VgpuRuntime::NewStub(channel);
 

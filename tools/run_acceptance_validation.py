@@ -9,10 +9,20 @@ import time
 
 
 KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^ \n]+)")
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 def env_with_ld_library_path(env):
     out = dict(env)
+    for key in PROXY_ENV_KEYS:
+        out.pop(key, None)
     ld = out.get("LD_LIBRARY_PATH", "")
     wsl_cuda = "/usr/lib/wsl/lib"
     if os.path.isdir(wsl_cuda) and wsl_cuda not in ld.split(":"):

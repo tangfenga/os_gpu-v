@@ -6,9 +6,20 @@ import sys
 import tempfile
 import time
 
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
 
 def proxy_env(args):
     env = dict(os.environ)
+    for key in PROXY_ENV_KEYS:
+        env.pop(key, None)
     ld = env.get("LD_LIBRARY_PATH", "")
     if os.path.isdir("/usr/lib/wsl/lib") and "/usr/lib/wsl/lib" not in ld.split(":"):
         env["LD_LIBRARY_PATH"] = "/usr/lib/wsl/lib" + (":" + ld if ld else "")
@@ -77,4 +88,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

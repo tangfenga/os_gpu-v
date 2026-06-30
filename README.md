@@ -89,6 +89,7 @@ Run a CUDA program through the proxy. This command assumes the project was confi
 
 ```bash
 VGPU_DATA_PLANE=shm \
+NO_PROXY=127.0.0.1,localhost \
 LD_PRELOAD="$PWD/build/libcudart_proxy.so" \
 VGPU_SERVER=127.0.0.1:50052 \
 ./build/vgpu_vector_add_smoke
@@ -104,6 +105,7 @@ Then run:
 
 ```bash
 VGPU_DATA_PLANE=shm \
+NO_PROXY=127.0.0.1,localhost \
 LD_PRELOAD="$PWD/build/libcudart_proxy.so" \
 VGPU_SERVER=127.0.0.1:50052 \
 /tmp/vgpu_vector_add_smoke
