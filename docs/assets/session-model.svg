@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="620" viewBox="0 0 1180 620" role="img" aria-labelledby="title desc">
+  <title id="title">os_gpu-v session resource model</title>
+  <desc id="desc">Each client process owns one session. A session contains virtual pointer mappings, CUDA module records, streams, events, pending error state, shared memory mapping and a ring worker.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 16; }
+      .session { fill: #f5f3ff; stroke: #8b5cf6; stroke-width: 2; rx: 18; }
+      .item { fill: #eef2ff; stroke: #a5b4fc; rx: 10; }
+      .client { fill: #eff6ff; stroke: #60a5fa; rx: 14; }
+      .gpu { fill: #ecfdf5; stroke: #22c55e; rx: 14; }
+      .text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .title { font-size: 32px; font-weight: 800; }
+      .label { font-size: 21px; font-weight: 800; }
+      .small { font-size: 18px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 16px; fill: #334155; }
+      .muted { fill: #475569; }
+      .line { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#334155"/></marker>
+  </defs>
+
+  <rect class="bg" width="1180" height="620"/>
+  <text x="54" y="58" class="text title">Per-process session resource model</text>
+  <text x="56" y="88" class="text muted small">The server isolates CUDA resources by session and translates client-visible handles before using the Driver API.</text>
+
+  <rect x="58" y="150" width="230" height="330" class="client"/>
+  <text x="88" y="192" class="text label">Client process A</text>
+  <text x="88" y="226" class="text mono">cudaMalloc -> vptr</text>
+  <text x="88" y="258" class="text mono">cudaMemcpy(vptr)</text>
+  <text x="88" y="290" class="text mono">cudaLaunchKernel</text>
+  <text x="88" y="350" class="text muted small">Only virtual handles</text>
+  <text x="88" y="378" class="text muted small">are visible here.</text>
+
+  <rect x="380" y="124" width="420" height="382" class="session"/>
+  <text x="412" y="166" class="text label">SessionState A</text>
+  <rect x="412" y="194" width="160" height="54" class="item"/>
+  <text x="432" y="227" class="text mono">allocation table</text>
+  <rect x="604" y="194" width="160" height="54" class="item"/>
+  <text x="626" y="227" class="text mono">module table</text>
+  <rect x="412" y="268" width="160" height="54" class="item"/>
+  <text x="432" y="301" class="text mono">stream table</text>
+  <rect x="604" y="268" width="160" height="54" class="item"/>
+  <text x="626" y="301" class="text mono">event table</text>
+  <rect x="412" y="342" width="160" height="54" class="item"/>
+  <text x="432" y="375" class="text mono">pending error</text>
+  <rect x="604" y="342" width="160" height="54" class="item"/>
+  <text x="626" y="375" class="text mono">shm mapping</text>
+  <rect x="508" y="418" width="160" height="54" class="item"/>
+  <text x="532" y="451" class="text mono">ring worker</text>
+
+  <rect x="900" y="150" width="230" height="330" class="gpu"/>
+  <text x="930" y="192" class="text label">CUDA Driver side</text>
+  <text x="930" y="226" class="text mono">CUdeviceptr</text>
+  <text x="930" y="258" class="text mono">CUmodule</text>
+  <text x="930" y="290" class="text mono">CUstream</text>
+  <text x="930" y="322" class="text mono">CUevent</text>
+  <text x="930" y="382" class="text muted small">Real GPU resources</text>
+  <text x="930" y="410" class="text muted small">stay on server side.</text>
+
+  <path class="line" d="M288 280 C320 280 342 280 378 280"/>
+  <text x="306" y="260" class="text muted small">session request</text>
+  <path class="line" d="M800 280 C835 280 862 280 898 280"/>
+  <text x="828" y="260" class="text muted small">handle translation</text>
+
+  <rect x="58" y="525" width="1072" height="54" class="box"/>
+  <text x="88" y="559" class="text small">
+    Isolation rule: virtual pointers, streams, events and pending errors are looked up inside the current session only.
+  </text>
+</svg>

@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="560" viewBox="0 0 1180 560" role="img" aria-labelledby="title desc">
+  <title id="title">os_gpu-v system architecture</title>
+  <desc id="desc">CUDA Runtime API proxy forwards CUDA process operations to a vGPU server through gRPC, shared memory and a per-session ring. The server executes CUDA Driver API calls on an NVIDIA GPU.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 16; }
+      .soft { fill: #eff6ff; stroke: #93c5fd; }
+      .green { fill: #ecfdf5; stroke: #86efac; }
+      .amber { fill: #fffbeb; stroke: #fcd34d; }
+      .purple { fill: #f5f3ff; stroke: #c4b5fd; }
+      .dark { fill: #0f172a; }
+      .text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .muted { fill: #475569; }
+      .small { font-size: 18px; }
+      .label { font-size: 21px; font-weight: 700; }
+      .title { font-size: 32px; font-weight: 800; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 17px; fill: #334155; }
+      .line { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#334155"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1180" height="560"/>
+  <text x="54" y="58" class="text title">os_gpu-v: lightweight CUDA Runtime virtualization</text>
+  <text x="56" y="88" class="text muted small">Process-level CUDA resource virtualization through a Runtime proxy and host-side Driver API execution</text>
+
+  <rect x="52" y="126" width="270" height="330" class="panel"/>
+  <text x="82" y="168" class="text label">CUDA application</text>
+  <text x="82" y="204" class="text muted small">unmodified user code</text>
+  <rect x="82" y="232" width="210" height="56" class="soft" rx="10"/>
+  <text x="104" y="267" class="text mono">cudaMalloc</text>
+  <rect x="82" y="304" width="210" height="56" class="soft" rx="10"/>
+  <text x="104" y="339" class="text mono">cudaMemcpy</text>
+  <rect x="82" y="376" width="210" height="56" class="soft" rx="10"/>
+  <text x="104" y="411" class="text mono">kernel launch</text>
+
+  <rect x="400" y="126" width="320" height="330" class="panel"/>
+  <text x="430" y="168" class="text label">libcudart_proxy.so</text>
+  <text x="430" y="204" class="text muted small">LD_PRELOAD Runtime API proxy</text>
+  <rect x="430" y="232" width="260" height="52" class="green" rx="10"/>
+  <text x="452" y="265" class="text mono">session + virtual ptr</text>
+  <rect x="430" y="300" width="260" height="52" class="green" rx="10"/>
+  <text x="452" y="333" class="text mono">fatbin/function map</text>
+  <rect x="430" y="368" width="260" height="52" class="green" rx="10"/>
+  <text x="452" y="401" class="text mono">shared memory block</text>
+
+  <rect x="805" y="126" width="320" height="330" class="panel"/>
+  <text x="835" y="168" class="text label">vgpu_server</text>
+  <text x="835" y="204" class="text muted small">session manager + CUDA Driver API</text>
+  <rect x="835" y="232" width="260" height="52" class="purple" rx="10"/>
+  <text x="857" y="265" class="text mono">allocation/module table</text>
+  <rect x="835" y="300" width="260" height="52" class="purple" rx="10"/>
+  <text x="857" y="333" class="text mono">stream/event table</text>
+  <rect x="835" y="368" width="260" height="52" class="purple" rx="10"/>
+  <text x="857" y="401" class="text mono">ring worker</text>
+
+  <path class="line" d="M322 275 C350 275 368 275 398 275"/>
+  <text x="337" y="258" class="text muted small">Runtime symbols</text>
+
+  <path class="line" d="M720 238 C754 238 770 238 803 238"/>
+  <text x="732" y="220" class="text muted small">gRPC control path</text>
+  <path class="line" d="M720 318 C754 318 770 318 803 318"/>
+  <text x="732" y="300" class="text muted small">shared memory data path</text>
+  <path class="line" d="M720 398 C754 398 770 398 803 398"/>
+  <text x="732" y="380" class="text muted small">SPSC ring fast path</text>
+
+  <rect x="835" y="482" width="260" height="48" class="amber" rx="10"/>
+  <text x="879" y="513" class="text mono">NVIDIA GPU</text>
+  <path class="line" d="M965 456 L965 480"/>
+  <text x="983" y="472" class="text muted small">CUDA Driver API</text>
+</svg>
