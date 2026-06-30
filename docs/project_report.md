@@ -2,7 +2,9 @@
 
 ## 1. 目标描述
 
-本项目面向轻量化 GPU 虚拟化赛题，目标是在不迁移完整 GPU 硬件状态的前提下，让用户 CUDA 进程的核心计算流程能够通过代理层转发到 server 侧 GPU 上执行。
+本项目选择的赛题编号为 `proj43`，题目方向是轻量化 GPU 虚拟化。赛题希望以 GPU 运行进程为基本单位，根据进程实际需要迁移必要的 CUDA 运行信息，降低完整 GPU 虚拟化中大量设备状态和数据迁移带来的开销。
+
+我们小组的目标是做出一个能跑通 CUDA 典型工作流的原型系统：用户程序仍然按普通 CUDA Runtime API 写法调用 `cudaMalloc`、`cudaMemcpy` 和 kernel launch；代理库截获这些调用后，把必要的显存信息、kernel 信息和同步信息发给 server；server 在可访问 NVIDIA GPU 的环境中执行真实 CUDA Driver API。这样，用户进程侧看到的是 CUDA Runtime 语义，真实 GPU 资源由 server 统一管理。
 
 项目最终实现的是一个 CUDA Runtime API 层的 GPU 进程虚拟化原型。用户程序通过 `LD_PRELOAD` 加载 `libcudart_proxy.so` 后，常用 CUDA Runtime API 会被代理库截获。代理库为每个用户进程创建一个 session，将显存分配、数据拷贝、kernel launch、stream/event 同步等请求转发给 `vgpu_server`。server 侧使用 CUDA Driver API 操作真实 NVIDIA GPU，并按 session 维护每个进程的虚拟资源。
 
@@ -10,11 +12,11 @@
 
 ## 2. 比赛题目分析和相关资料调研
 
-赛题背景中提到，GPU 在云环境中价格较高，多用户共享 GPU 是实际需求；但完整 GPU 虚拟化会涉及大量设备状态和数据迁移，容易带来明显延迟。因此，我们把问题拆成两层：一层是“CUDA 程序真正依赖哪些运行时状态”，另一层是“这些状态如何在 client 和 server 之间表达”。
+赛题背景中提到，GPU 在云环境中价格较高，多用户共享 GPU 是实际需求；但完整 GPU 虚拟化会涉及大量设备状态和数据迁移，容易带来明显延迟。因此，我们最开始没有直接写代码，而是先把题目拆成两层：一层是“CUDA 程序真正依赖哪些运行时状态”，另一层是“这些状态如何在 client 和 server 之间表达”。
 
-CUDA 程序的一般流程包括查询设备、分配显存、Host 到 Device 拷贝、kernel launch、Device 到 Host 拷贝、stream/event 同步以及资源释放。围绕这个流程，我们重点阅读了 CUDA Runtime API 和 CUDA Driver API 文档，对比两类接口的职责：Runtime API 更接近用户程序，适合作为拦截入口；Driver API 控制更细，适合在 server 端执行真实 GPU 操作。
+CUDA 程序的一般流程包括查询设备、分配显存、Host 到 Device 拷贝、kernel launch、Device 到 Host 拷贝、stream/event 同步以及资源释放。围绕这个流程，我们重点阅读了 CUDA Runtime API 和 CUDA Driver API 文档，对比两类接口的职责：Runtime API 更接近用户程序，适合作为拦截入口；Driver API 控制更细，适合在 server 端执行真实 GPU 操作。这个判断基本决定了项目的整体路线：client 侧模拟 Runtime，server 侧执行 Driver。
 
-CRIUgpu 和 Cricket 给我们的主要参考是：GPU 进程迁移不能只看 CPU 内存，必须识别 CUDA 运行时中的显存、kernel、stream、event 等状态；同时，数据面传输不能全部走通用 RPC，否则大块 Host/Device 数据会成为瓶颈。结合这些资料，我们确定了 Runtime API 拦截、session 资源表、shared memory 数据面和 ring fast path 这几项主要设计。
+CRIUgpu 和 Cricket 给我们的主要参考是：GPU 进程迁移不能只看 CPU 内存，必须识别 CUDA 运行时中的显存、kernel、stream、event 等状态；同时，数据面传输不能全部走通用 RPC，否则大块 Host/Device 数据会成为瓶颈。结合这些资料，我们确定了 Runtime API 拦截、session 资源表、shared memory 数据面和 ring fast path 这几项主要设计。cuda-gdb 和 Nsight Compute 的资料主要帮助我们理解 CUDA 程序调试、kernel 执行和性能观察方式，虽然项目中没有把这些工具作为运行时依赖，但它们对分析 CUDA 执行流程有帮助。
 
 本项目参考资料包括：
 
@@ -107,11 +109,11 @@ server 侧以 session 为隔离单位。每个 client 进程对应一个 `Sessio
 
 项目按三人小组的方式分工推进。
 
-成员 A 主要负责 client 侧代理库，包括 `LD_PRELOAD` 拦截、Runtime API 包装、session 初始化、shared memory block 管理、kernel registration 记录和 last error 语义。
+黄昱嘉主要负责 client 侧代理库，包括 `LD_PRELOAD` 拦截、Runtime API 包装、session 初始化、shared memory block 管理、kernel registration 记录和 last error 语义。
 
-成员 B 主要负责 server 侧资源虚拟化，包括 gRPC service、SessionState、allocation/module/stream/event table、virtual pointer 翻译、CUDA Driver API 调用和资源清理。
+程昶斌主要负责 server 侧资源虚拟化，包括 gRPC service、SessionState、allocation/module/stream/event table、virtual pointer 翻译、CUDA Driver API 调用和资源清理。
 
-成员 C 主要负责测试、性能优化和文档整理，包括 vector/matrix/memcpy 测试、双进程并发脚本、跨 session 同步测试、ring stress、稳定性测试、性能数据整理和项目报告。
+石锐主要负责测试、性能优化和文档整理，包括 vector/matrix/memcpy 测试、双进程并发脚本、跨 session 同步测试、ring stress、稳定性测试、性能数据整理和项目报告。
 
 实际开发中三个部分不是完全割裂的。比如 kernel launch 同时涉及 client registration、协议字段和 server module/function 查找；ring fast path 同时涉及 client submit、shared memory 数据结构和 server worker。因此每个阶段都会一起对接口、调试日志和测试输出，先保证功能正确，再根据 benchmark 调整路径。
 

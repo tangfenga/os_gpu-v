@@ -1,8 +1,12 @@
 # os_gpu-v
 
+Selected topic: `proj43` - lightweight GPU virtualization.
+
 `os_gpu-v` is a lightweight CUDA Runtime API virtualization prototype. It intercepts CUDA Runtime calls from a client process, forwards the required GPU process state and data to a server, and executes the work on a host NVIDIA GPU through the CUDA Driver API.
 
 The design focuses on process-level CUDA resource virtualization: only the CUDA Runtime state and data needed by a running GPU process are represented and transferred.
+
+The contest task asks for a lightweight GPU virtualization design that takes a running GPU process as the migration/virtualization unit, captures the operator and CUDA runtime information needed by the client process, forwards the work to a host-side NVIDIA GPU, and reduces the data-transfer overhead with concurrency and synchronization optimizations.
 
 ## Features
 
